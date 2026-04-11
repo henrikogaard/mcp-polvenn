@@ -143,10 +143,10 @@ Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-After restarting Claude Desktop, configure the hosted collector from chat:
+After restarting Claude Desktop, configure your own collector from chat:
 
 ```text
-Configure polvenn with release feed URL https://beer.ogard.cloud.
+Configure polvenn with release feed URL https://releases.example.com.
 ```
 
 ### Codex
@@ -161,10 +161,10 @@ args = ["/absolute/path/to/polvenn-mcp-server/dist/index.js"]
 
 Restart Codex after saving the config.
 
-Then configure the hosted collector from a Codex chat:
+Then configure your own collector from a Codex chat:
 
 ```text
-Configure polvenn with release feed URL https://beer.ogard.cloud.
+Configure polvenn with release feed URL https://releases.example.com.
 ```
 
 ### ChatGPT
@@ -188,27 +188,55 @@ In other words:
 
 Once connected from an MCP client, configure the local server with your keys and defaults.
 
-### Hosted collector setup
+### External collector setup
 
-If your collector is deployed on a VPS, Polvenn still runs locally as a stdio MCP server. Only the release feed becomes remote.
-
-For your setup:
+Polvenn expects an external release collector that exposes:
 
 ```text
-releaseFeedUrl = https://beer.ogard.cloud
+GET /releases/latest
+```
+
+You can run your own collector from GitHub here:
+
+- [henrikogaard/polvenn-release-collector](https://github.com/henrikogaard/polvenn-release-collector)
+
+Quick setup:
+
+1. Clone the collector repo.
+2. Run `npm install`.
+3. Run `npm run build`.
+4. Copy `polvenn-release-collector.config.example.json` to `polvenn-release-collector.config.json`.
+5. Start it with `npm start`.
+6. Verify `http://127.0.0.1:4100/health`.
+7. Verify `http://127.0.0.1:4100/releases/latest?limit=3`.
+
+If you want to expose it publicly on a VPS, follow the deployment guide in the collector repo:
+
+- [polvenn-release-collector/deploy/DEPLOY.md](https://github.com/henrikogaard/polvenn-release-collector/blob/main/deploy/DEPLOY.md)
+
+Once your collector is running, choose your own feed URL, for example:
+
+```text
+releaseFeedUrl = http://127.0.0.1:4100
+```
+
+or:
+
+```text
+releaseFeedUrl = https://releases.example.com
 ```
 
 That means the local MCP server will read from:
 
 ```text
-https://beer.ogard.cloud/releases/latest?limit=...
+https://releases.example.com/releases/latest?limit=...
 ```
 
 Recommended order:
 
-1. Deploy `polvenn-release-collector` to the VPS.
-2. Verify `https://beer.ogard.cloud/health`.
-3. Verify `https://beer.ogard.cloud/releases/latest?limit=3`.
+1. Set up your own `polvenn-release-collector`.
+2. Verify its `/health` endpoint.
+3. Verify its `/releases/latest?limit=3` endpoint.
 4. Start `polvenn-mcp-server` locally in Codex or Claude Desktop.
 5. Configure Polvenn with the hosted `releaseFeedUrl`.
 6. Validate the configuration from the MCP client.
@@ -227,12 +255,6 @@ Set home store to 170.
 
 ```text
 Validate my Polvenn configuration and tell me which integrations are working.
-```
-
-For your production collector, use:
-
-```text
-Configure polvenn with release feed URL https://beer.ogard.cloud.
 ```
 
 ## Example Prompts
