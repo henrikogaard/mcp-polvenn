@@ -1,6 +1,6 @@
 {
   "name": "@henrikogard/polvenn-mcp-server",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "MCP server for tracking beer releases on Vinmonopolet with an external release feed",
   "author": "Henrik",
   "type": "module",
@@ -31,8 +31,13 @@
     "build": "rm -rf dist && tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "prepack": "npm run build",
-    "test": "npm run build && node --test dist/**/*.test.js"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check src",
+    "format": "biome format --write src",
+    "smoke": "node scripts/smoke.mjs",
+    "prepack": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -48,13 +53,15 @@
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "sql.js": "^1.11.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "cheerio": "^1.0.0",
-    "zod": "^3.24.0"
+    "sql.js": "^1.11.0",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.13",
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.0"
   }
 }

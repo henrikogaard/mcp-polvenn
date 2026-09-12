@@ -1,25 +1,88 @@
 import * as cheerio from "cheerio";
+import { z } from "zod";
 import {
+  FETCH_CONCURRENCY,
   MAX_LIMIT,
+  STORES_CACHE_TTL_MS,
+  USER_AGENT,
   VINMONOPOLET_API_BASE,
   VINMONOPOLET_PRODUCTS_PATH,
-  VINMONOPOLET_STORES_PATH,
   VINMONOPOLET_STOCK_PATH,
+  VINMONOPOLET_STORES_PATH,
+  VINMONOPOLET_WEB_BASE,
   VINMONOPOLET_WEB_PRODUCT_STOCK_PATH,
   VINMONOPOLET_WEB_SEARCH_PATH,
   VINMONOPOLET_WEB_STORES_PATH,
-  VINMONOPOLET_WEB_BASE,
-  USER_AGENT,
 } from "../constants.js";
+import { getCachedBeer, getConfigValue, setCachedBeer } from "../db/database.js";
 import type {
   VinmonopoletProduct,
   VinmonopoletStockCheck,
   VinmonopoletStockRow,
   VinmonopoletStore,
 } from "../types.js";
-import { getCachedBeer, getConfigValue, setCachedBeer } from "../db/database.js";
+import { mapWithConcurrency } from "../utils/concurrency.js";
 import { haversineDistanceKm } from "../utils/geo.js";
 import { fetchWithRetry } from "../utils/http.js";
+
+// Lenient response schemas: these endpoints are only loosely documented, so we
+// validate just the invariants the code relies on and let everything else
+// through. Non-conforming entries are dropped with a warning instead of
+// failing the whole tool call (see parseValidEntries / parseEnvelope).
+const ApiProductSchema = z.looseObject({
+  basic: z.looseObject({ productId: z.string().min(1) }),
+});
+
+const ApiStoreSchema = z.looseObject({
+  storeId: z.string().min(1),
+  storeName: z.string().min(1),
+});
+
+const ApiStockRowSchema = z.looseObject({
+  productId: z.string().min(1),
+  storeId: z.string().min(1),
+  stock: z.number(),
+});
+
+const WebsiteSearchResponseSchema = z.looseObject({
+  products: z.array(z.unknown()).optional(),
+});
+
+const WebsiteStoreSchema = z.looseObject({
+  geoPoint: z
+    .looseObject({
+      latitude: z.number().optional(),
+      longitude: z.number().optional(),
+    })
+    .optional(),
+});
+
+const WebsiteStockLocatorResponseSchema = z.looseObject({
+  stores: z.array(z.unknown()).optional(),
+});
+
+function parseValidEntries<T>(label: string, schema: z.ZodType<T>, rows: unknown[]): T[] {
+  const valid: T[] = [];
+  rows.forEach((row, index) => {
+    const result = schema.safeParse(row);
+    if (result.success) {
+      valid.push(result.data);
+    } else {
+      console.error(
+        `polvenn: dropping malformed ${label} at index ${index}: ${result.error.message}`,
+      );
+    }
+  });
+  return valid;
+}
+
+function parseEnvelope<T>(schema: z.ZodType<T>, payload: unknown, source: string): T {
+  const result = schema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(`Unexpected ${source} response shape: ${result.error.message}`);
+  }
+  return result.data;
+}
 
 interface VinmonopoletWebsiteProduct {
   code?: string;
@@ -90,15 +153,6 @@ interface VinmonopoletWebsiteSearchProduct {
   };
 }
 
-interface VinmonopoletWebsiteSearchResponse {
-  products?: VinmonopoletWebsiteSearchProduct[];
-  pagination?: {
-    currentPage?: number;
-    totalPages?: number;
-    totalResults?: number;
-  };
-}
-
 interface VinmonopoletWebsiteStore {
   id?: string;
   name?: string;
@@ -123,13 +177,13 @@ async function getApiKey(): Promise<string> {
   if (!key) {
     throw new Error(
       "Vinmonopolet API key not configured. Use polvenn_configure to set it. " +
-      "Register at https://api.vinmonopolet.no and subscribe to the 'Open' product."
+        "Register at https://api.vinmonopolet.no and subscribe to the 'Open' product.",
     );
   }
   return key;
 }
 
-async function apiRequest<T>(path: string, params: Record<string, string> = {}): Promise<T> {
+async function apiRequest(path: string, params: Record<string, string> = {}): Promise<unknown> {
   const url = new URL(path, VINMONOPOLET_API_BASE);
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value);
@@ -145,18 +199,13 @@ async function apiRequest<T>(path: string, params: Record<string, string> = {}):
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(
-      `Vinmonopolet API error ${response.status}: ${response.statusText}. ${body}`
-    );
+    throw new Error(`Vinmonopolet API error ${response.status}: ${response.statusText}. ${body}`);
   }
 
-  return response.json() as Promise<T>;
+  return response.json();
 }
 
-async function websiteRequest<T>(
-  path: string,
-  params: Record<string, string> = {},
-): Promise<T> {
+async function websiteRequest(path: string, params: Record<string, string> = {}): Promise<unknown> {
   const url = new URL(path, VINMONOPOLET_WEB_BASE);
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value);
@@ -176,11 +225,11 @@ async function websiteRequest<T>(
     );
   }
 
-  return response.json() as Promise<T>;
+  return response.json();
 }
 
-async function websiteSearchRequest<T>(params: Record<string, string>): Promise<T> {
-  return websiteRequest<T>(VINMONOPOLET_WEB_SEARCH_PATH, params);
+async function websiteSearchRequest(params: Record<string, string>): Promise<unknown> {
+  return websiteRequest(VINMONOPOLET_WEB_SEARCH_PATH, params);
 }
 
 function normalizeSearchQuery(query: string): string {
@@ -213,14 +262,16 @@ function buildProductPageUrl(productId: string): string {
 
 function isDetailedProduct(product: VinmonopoletProduct): boolean {
   return Boolean(
-    product.classification?.mainProductTypeName
-    && product.origins?.productionOrigin?.producerName
-    && product.prices?.salesPrice != null,
+    product.classification?.mainProductTypeName &&
+      product.origins?.productionOrigin?.producerName &&
+      product.prices?.salesPrice != null,
   );
 }
 
 function hasReusableCachedProduct(product: VinmonopoletProduct): boolean {
-  return isDetailedProduct(product) && Boolean(product.lastChanged?.date && product.lastChanged?.time);
+  return (
+    isDetailedProduct(product) && Boolean(product.lastChanged?.date && product.lastChanged?.time)
+  );
 }
 
 function mergeProductData(
@@ -239,15 +290,15 @@ function mergeProductData(
       : fallbackProduct.classification,
     origins: apiProduct.origins
       ? {
-        origin: {
-          ...(fallbackProduct.origins?.origin ?? {}),
-          ...apiProduct.origins.origin,
-        },
-        productionOrigin: {
-          ...(fallbackProduct.origins?.productionOrigin ?? {}),
-          ...apiProduct.origins.productionOrigin,
-        },
-      }
+          origin: {
+            ...(fallbackProduct.origins?.origin ?? {}),
+            ...apiProduct.origins.origin,
+          },
+          productionOrigin: {
+            ...(fallbackProduct.origins?.productionOrigin ?? {}),
+            ...apiProduct.origins.productionOrigin,
+          },
+        }
       : fallbackProduct.origins,
     logistics: apiProduct.logistics
       ? { ...(fallbackProduct.logistics ?? {}), ...apiProduct.logistics }
@@ -473,54 +524,62 @@ export function isStockAccessLimitedError(error: unknown): boolean {
 
 export function isInvalidApiKeyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /401|invalid subscription key|access denied due to invalid subscription key/i.test(message);
+  return /401|invalid subscription key|access denied due to invalid subscription key/i.test(
+    message,
+  );
 }
 
 /** Fetch all products, optionally filtered by changedSince date */
-export async function getProducts(options: {
-  changedSince?: string;
-  maxResults?: number;
-  start?: number;
-} = {}): Promise<VinmonopoletProduct[]> {
+export async function getProducts(
+  options: { changedSince?: string; maxResults?: number; start?: number } = {},
+): Promise<VinmonopoletProduct[]> {
   const params: Record<string, string> = {};
   if (options.changedSince) params.changedSince = options.changedSince;
   if (options.maxResults) params.maxResults = String(options.maxResults);
   if (options.start) params.start = String(options.start);
 
-  return apiRequest<VinmonopoletProduct[]>(VINMONOPOLET_PRODUCTS_PATH, params);
+  const payload = await apiRequest(VINMONOPOLET_PRODUCTS_PATH, params);
+  const rows = Array.isArray(payload) ? payload : [];
+  return parseValidEntries("product", ApiProductSchema, rows) as unknown as VinmonopoletProduct[];
 }
 
-async function getWebsiteBeerListings(query: string, maxResults = 25): Promise<VinmonopoletProduct[]> {
-  const response = await websiteSearchRequest<VinmonopoletWebsiteSearchResponse>({
-    q: query,
-    fields: "FULL",
-    pageSize: String(maxResults),
-    currentPage: "0",
-  });
+async function getWebsiteBeerListings(
+  query: string,
+  maxResults = 25,
+): Promise<VinmonopoletProduct[]> {
+  const payload = parseEnvelope(
+    WebsiteSearchResponseSchema,
+    await websiteSearchRequest({
+      q: query,
+      fields: "FULL",
+      pageSize: String(maxResults),
+      currentPage: "0",
+    }),
+    "vinmonopolet.no search",
+  );
 
-  const candidates = response.products ?? [];
-  const results: VinmonopoletProduct[] = [];
+  const candidates = (payload.products ?? []) as VinmonopoletWebsiteSearchProduct[];
 
-  for (const candidate of candidates) {
+  // Each candidate needs its own detail lookup; run them with bounded
+  // concurrency instead of one-at-a-time so a 100-item listing doesn't
+  // turn into 100 sequential requests.
+  const products = await mapWithConcurrency(candidates, FETCH_CONCURRENCY, async (candidate) => {
     const productId = candidate.code?.trim();
     if (!productId) {
-      continue;
-    }
-
-    const detailed = await getProductById(productId);
-    if (detailed) {
-      const mapped = mapWebsiteSearchProductToVinmonopoletProduct(candidate);
-      results.push(mapped ? mergeProductData(detailed, mapped) : detailed);
-      continue;
+      return null;
     }
 
     const mapped = mapWebsiteSearchProductToVinmonopoletProduct(candidate);
-    if (mapped) {
-      results.push(mapped);
+    const detailed = await getProductById(productId);
+    if (detailed) {
+      return mapped ? mergeProductData(detailed, mapped) : detailed;
     }
-  }
+    return mapped;
+  });
 
-  return results.filter(isBeer);
+  return products
+    .filter((product): product is VinmonopoletProduct => product != null)
+    .filter(isBeer);
 }
 
 export async function getUpcomingBeers(maxResults = 25): Promise<VinmonopoletProduct[]> {
@@ -535,11 +594,17 @@ export async function getNewBeersForStore(
   storeId: string,
   maxResults = MAX_LIMIT,
 ): Promise<VinmonopoletProduct[]> {
-  return getWebsiteBeerListings(`:relevance:mainCategory:øl:newProducts:true:availableInStores:${storeId}`, maxResults);
+  return getWebsiteBeerListings(
+    `:relevance:mainCategory:øl:newProducts:true:availableInStores:${storeId}`,
+    maxResults,
+  );
 }
 
 /** Search products by name */
-export async function searchProducts(query: string, maxResults = 25): Promise<VinmonopoletProduct[]> {
+export async function searchProducts(
+  query: string,
+  maxResults = 25,
+): Promise<VinmonopoletProduct[]> {
   const trimmedQuery = query.trim();
   if (!trimmedQuery) {
     return [];
@@ -550,10 +615,12 @@ export async function searchProducts(query: string, maxResults = 25): Promise<Vi
     return product ? [product] : [];
   }
 
-  return apiRequest<VinmonopoletProduct[]>(
-    `${VINMONOPOLET_PRODUCTS_PATH}`,
-    { productShortNameContains: normalizeSearchQuery(trimmedQuery), maxResults: String(maxResults) }
-  );
+  const payload = await apiRequest(VINMONOPOLET_PRODUCTS_PATH, {
+    productShortNameContains: normalizeSearchQuery(trimmedQuery),
+    maxResults: String(maxResults),
+  });
+  const rows = Array.isArray(payload) ? payload : [];
+  return parseValidEntries("product", ApiProductSchema, rows) as unknown as VinmonopoletProduct[];
 }
 
 /** Get a single product by ID */
@@ -568,11 +635,16 @@ export async function getProductById(productId: string): Promise<VinmonopoletPro
 
   let apiProduct: VinmonopoletProduct | null = null;
   try {
-    const products = await apiRequest<VinmonopoletProduct[]>(
-      VINMONOPOLET_PRODUCTS_PATH,
-      { productId }
-    );
-
+    const payload = await apiRequest(VINMONOPOLET_PRODUCTS_PATH, {
+      productId,
+    });
+    const products = Array.isArray(payload)
+      ? (parseValidEntries(
+          "product",
+          ApiProductSchema,
+          payload,
+        ) as unknown as VinmonopoletProduct[])
+      : [];
     apiProduct = products[0] ?? null;
   } catch {
     apiProduct = null;
@@ -597,32 +669,76 @@ export async function getProductById(productId: string): Promise<VinmonopoletPro
   return product;
 }
 
-/** Get all stores */
+let storeListCache: { stores: VinmonopoletStore[]; fetchedAt: number } | null = null;
+let storeListFetch: Promise<VinmonopoletStore[]> | null = null;
+
+/** Get all stores, cached in memory for STORES_CACHE_TTL_MS */
 export async function getStores(): Promise<VinmonopoletStore[]> {
-  return apiRequest<VinmonopoletStore[]>(VINMONOPOLET_STORES_PATH);
+  if (storeListCache && Date.now() - storeListCache.fetchedAt < STORES_CACHE_TTL_MS) {
+    return storeListCache.stores;
+  }
+
+  // Share a single in-flight request between concurrent callers.
+  if (!storeListFetch) {
+    storeListFetch = (async () => {
+      try {
+        const payload = await apiRequest(VINMONOPOLET_STORES_PATH);
+        const rows = Array.isArray(payload) ? payload : [];
+        const stores = parseValidEntries(
+          "store",
+          ApiStoreSchema,
+          rows,
+        ) as unknown as VinmonopoletStore[];
+        storeListCache = { stores, fetchedAt: Date.now() };
+        return stores;
+      } finally {
+        storeListFetch = null;
+      }
+    })();
+  }
+
+  return storeListFetch;
+}
+
+/** Test hook: forget the in-memory store list cache. */
+export function resetStoreListCacheForTests(): void {
+  storeListCache = null;
+  storeListFetch = null;
 }
 
 /** Get stock for a product, optionally filtered by store */
-export async function getStock(options: {
-  productId?: string;
-  storeId?: string;
-  changedSince?: string;
-} = {}): Promise<VinmonopoletStockRow[]> {
+export async function getStock(
+  options: { productId?: string; storeId?: string; changedSince?: string } = {},
+): Promise<VinmonopoletStockRow[]> {
   const params: Record<string, string> = {};
   if (options.productId) params.productId = options.productId;
   if (options.storeId) params.storeId = options.storeId;
   if (options.changedSince) params.changedSince = options.changedSince;
 
-  return apiRequest<VinmonopoletStockRow[]>(VINMONOPOLET_STOCK_PATH, params);
+  const payload = await apiRequest(VINMONOPOLET_STOCK_PATH, params);
+  const rows = Array.isArray(payload) ? payload : [];
+  return parseValidEntries(
+    "stock row",
+    ApiStockRowSchema,
+    rows,
+  ) as unknown as VinmonopoletStockRow[];
 }
 
-async function getWebsiteStoreById(storeId: string): Promise<VinmonopoletWebsiteStore> {
-  return websiteRequest<VinmonopoletWebsiteStore>(`${VINMONOPOLET_WEB_STORES_PATH}/${encodeURIComponent(storeId)}`, {
-    fields: "FULL",
-  });
+async function getWebsiteStoreById(storeId: string) {
+  const payload = parseEnvelope(
+    WebsiteStoreSchema,
+    await websiteRequest(`${VINMONOPOLET_WEB_STORES_PATH}/${encodeURIComponent(storeId)}`, {
+      fields: "FULL",
+    }),
+    "vinmonopolet.no store",
+  );
+  return payload;
 }
 
-async function getWebsiteStockRows(productId: string, storeId: string): Promise<VinmonopoletStockRow[]> {
+async function getWebsiteStockRows(
+  productId: string,
+  storeId: string,
+): Promise<VinmonopoletStockRow[]> {
   const store = await getWebsiteStoreById(storeId);
   const latitude = store.geoPoint?.latitude;
   const longitude = store.geoPoint?.longitude;
@@ -631,18 +747,24 @@ async function getWebsiteStockRows(productId: string, storeId: string): Promise<
     throw new Error(`Vinmonopolet website store ${storeId} did not include coordinates.`);
   }
 
-  const response = await websiteRequest<VinmonopoletWebsiteStockLocatorResponse>(
-    `${VINMONOPOLET_WEB_PRODUCT_STOCK_PATH}/${encodeURIComponent(productId)}/stock`,
-    {
-      pageSize: "10",
-      currentPage: "0",
-      fields: "BASIC",
-      latitude: latitude.toString(),
-      longitude: longitude.toString(),
-    },
+  const payload = parseEnvelope(
+    WebsiteStockLocatorResponseSchema,
+    await websiteRequest(
+      `${VINMONOPOLET_WEB_PRODUCT_STOCK_PATH}/${encodeURIComponent(productId)}/stock`,
+      {
+        pageSize: "10",
+        currentPage: "0",
+        fields: "BASIC",
+        latitude: latitude.toString(),
+        longitude: longitude.toString(),
+      },
+    ),
+    "vinmonopolet.no stock locator",
   );
 
-  const rows = (response.stores ?? [])
+  const rows = (
+    (payload.stores ?? []) as NonNullable<VinmonopoletWebsiteStockLocatorResponse["stores"]>
+  )
     .map((entry): VinmonopoletStockRow | null => {
       const pointOfService = entry.pointOfService;
       const matchedStoreId = pointOfService?.id ?? pointOfService?.name;
@@ -663,7 +785,10 @@ async function getWebsiteStockRows(productId: string, storeId: string): Promise<
   return rows;
 }
 
-export async function checkStoreStock(productId: string, storeId: string): Promise<VinmonopoletStockCheck> {
+export async function checkStoreStock(
+  productId: string,
+  storeId: string,
+): Promise<VinmonopoletStockCheck> {
   try {
     const rows = await getStock({ productId, storeId });
     const stockLevel = rows[0]?.stock ?? 0;
@@ -701,10 +826,13 @@ export async function checkStoreStock(productId: string, storeId: string): Promi
       if (isInvalidApiKeyError(error)) {
         details.push("The configured Vinmonopolet API key is invalid.");
       } else {
-        details.push("Vinmonopolet's official stock endpoint is not available with the current API access.");
+        details.push(
+          "Vinmonopolet's official stock endpoint is not available with the current API access.",
+        );
       }
 
-      const fallbackMessage = websiteError instanceof Error ? websiteError.message : String(websiteError);
+      const fallbackMessage =
+        websiteError instanceof Error ? websiteError.message : String(websiteError);
       if (fallbackMessage) {
         details.push(`Website stock fallback failed: ${fallbackMessage}`);
       }
@@ -732,18 +860,18 @@ export function isBeer(product: VinmonopoletProduct): boolean {
 export async function findNearbyStores(
   lat: number,
   lon: number,
-  maxResults = 5
+  maxResults = 5,
 ): Promise<Array<VinmonopoletStore & { distanceKm: number }>> {
   const stores = await getStores();
 
   const withDistance = stores
-      .filter((s) => s.address.gpsCoord)
-      .map((store) => {
-        const [storeLat, storeLon] = store.address.gpsCoord.split(";").map(Number);
-          const distanceKm = haversineDistanceKm(lat, lon, storeLat, storeLon);
-          return { ...store, distanceKm };
-      })
-      .sort((a, b) => a.distanceKm - b.distanceKm);
+    .filter((store) => store.address?.gpsCoord)
+    .map((store) => {
+      const [storeLat, storeLon] = store.address.gpsCoord.split(";").map(Number);
+      const distanceKm = haversineDistanceKm(lat, lon, storeLat, storeLon);
+      return { ...store, distanceKm };
+    })
+    .sort((a, b) => a.distanceKm - b.distanceKm);
 
   return withDistance.slice(0, maxResults);
 }

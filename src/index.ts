@@ -2,16 +2,20 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SERVER_NAME } from "./constants.js";
+import { SERVER_NAME, SERVER_VERSION } from "./constants.js";
 import { closeDb, persistDb } from "./db/database.js";
+import { registerPrompts } from "./prompts/index.js";
+import { registerResources } from "./resources/index.js";
 import { registerAllTools } from "./tools/index.js";
 
 const server = new McpServer({
   name: SERVER_NAME,
-  version: "0.1.0",
+  version: SERVER_VERSION,
 });
 
 registerAllTools(server);
+registerResources(server);
+registerPrompts(server);
 
 let isShuttingDown = false;
 

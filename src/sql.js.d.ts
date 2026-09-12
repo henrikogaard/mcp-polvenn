@@ -16,6 +16,6 @@ declare module "sql.js" {
     values: unknown[][];
   }
 
-  export type { Database, SqlJsStatic, QueryExecResult };
+  export type { Database, QueryExecResult, SqlJsStatic };
   export default function initSqlJs(): Promise<SqlJsStatic>;
 }

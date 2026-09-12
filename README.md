@@ -14,18 +14,35 @@ It is designed to run as a local stdio MCP server:
 
 ## What It Does
 
-Polvenn exposes 8 MCP tools:
+Polvenn exposes 10 MCP tools, 2 MCP resources, and 3 MCP prompts. Every tool declares its structured output schema, so strict MCP clients get a contractually valid `structuredContent` payload alongside human-readable text.
 
 | Tool | Description | Writes data? |
 |------|-------------|--------------|
 | `polvenn_search_new_beers` | Search Vinmonopolet's current `Nyheter` listing and/or your external release feed, with optional `Kommende nyheter`, `releaseDate`, and `storeId` filters | No |
 | `polvenn_search_upcoming_beers` | Search Vinmonopolet's "Kommende nyheter" listing for upcoming beer releases | No |
 | `polvenn_search_new_beers_near_store` | Search current `Nyheter` available in one store, using your configured home store or nearest configured location by default | No |
+| `polvenn_search_products` | Search Vinmonopolet's full product catalogue by name or article number (not limited to beer) | No |
+| `polvenn_get_product` | Get full details for one product by article number: price, ABV, volume, availability, tasting notes | No |
 | `polvenn_check_store_stock` | Check stock for a beer at a Vinmonopolet store, using the official API when possible and Vinmonopolet's web stock locator as fallback | No |
 | `polvenn_find_nearby_stores` | Find the closest Vinmonopolet stores to a coordinate | No |
 | `polvenn_watchlist` | Add, remove, list, and check watch rules | Yes |
 | `polvenn_configure` | Store API keys, home store, and home coordinates locally | Yes |
 | `polvenn_validate_config` | Validate current config and probe upstream capabilities | No |
+
+### Resources
+
+| URI | Description |
+|-----|-------------|
+| `polvenn://watchlist` | Your saved watchlist rules as JSON (subscribable — updated when rules change) |
+| `polvenn://config` | Current configuration as JSON (API key masked) |
+
+### Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `polvenn_check_watchlist` | Check the watchlist and summarize new matches |
+| `polvenn_whats_new` | Find new releases, optionally filtered by `style` and `storeId` |
+| `polvenn_stock_check` | Check stock for an `articleNumber` at a store |
 
 Typical use cases:
 
@@ -63,23 +80,32 @@ Project structure:
 ```text
 src/
 ├── index.ts              # MCP server entry point
-├── constants.ts          # URLs, defaults, retry settings
+├── constants.ts          # URLs, defaults, retry/timeout settings
 ├── types.ts              # Domain types
 ├── sql.js.d.ts           # Local sql.js typings
 ├── tools/
-│   └── index.ts          # MCP tool registration and handlers
+│   ├── index.ts          # MCP tool registration and handlers
+│   └── server.test.ts    # End-to-end tests over the SDK in-memory transport
+├── resources/
+│   └── index.ts          # polvenn://watchlist and polvenn://config resources
+├── prompts/
+│   └── index.ts          # MCP prompts
 ├── schemas/
-│   └── tools.ts          # Zod input schemas
+│   ├── tools.ts          # Zod input schemas
+│   └── output.ts         # Zod output schemas (structured content contracts)
 ├── services/
 │   ├── release-feed.ts   # External release feed client
 │   ├── vinmonopolet.ts   # Vinmonopolet API client
 │   └── watchlist.ts      # Watchlist matching logic
 ├── utils/
+│   ├── concurrency.ts    # Bounded-concurrency async mapping
 │   ├── geo.ts
-│   ├── geo.test.ts
-│   └── http.ts
-└── db/
-    └── database.ts       # SQLite persistence and config
+│   └── http.ts           # Fetch with retry, backoff, and timeouts
+├── db/
+│   ├── database.ts       # SQLite persistence, migrations, config
+│   └── migrations.test.ts
+└── test/
+    └── setup.ts          # Per-file throwaway data dir for tests
 ```
 
 ## Setup
@@ -307,7 +333,7 @@ Check my watchlist against the latest release in my external feed.
 
 ## Watchlist Rules
 
-The watchlist supports four rule types:
+The watchlist supports seven rule types:
 
 | Type | Matches against | Example |
 |------|-----------------|---------|
@@ -315,6 +341,11 @@ The watchlist supports four rule types:
 | `style` | Beer style | `Imperial Stout` |
 | `series` | Beer name | `Racketeers` |
 | `keyword` | Beer name and producer | `barrel aged` |
+| `country` | Country of origin | `Norge` |
+| `abv` | ABV bounds (`minValue`/`maxValue`) | `abv 8–12` |
+| `price` | Price bounds (`minValue`/`maxValue`), best-effort | `price <= 200` |
+
+Text rules match by substring. `abv` and `price` rules take numeric bounds instead of `value` (which is derived, e.g. `abv >= 10`). Price rules are best-effort: prices are looked up via Vinmonopolet during a check, and beers whose price cannot be resolved are reported as not evaluated rather than silently skipped or guessed.
 
 ## Storage
 
@@ -391,11 +422,15 @@ The package metadata is set up for npm publishing:
 ## Development
 
 ```bash
-npm run dev
-npx tsc --noEmit
+npm run dev         # tsc --watch
+npm run typecheck   # tsc --noEmit
+npm run lint        # biome check
+npm test            # vitest run (tests never touch your real ~/.polvenn data)
 npm run build
-npm test
+npm run smoke       # spawns dist/index.js and verifies the MCP handshake, tools, resources, prompts
 ```
+
+CI runs lint, typecheck, tests, build, and the smoke script on Node 20/22/24 via GitHub Actions.
 
 ### Test With MCP Inspector
 
@@ -410,8 +445,10 @@ npx @modelcontextprotocol/inspector node dist/index.js
 | `@modelcontextprotocol/sdk` | MCP server framework |
 | `sql.js` | SQLite in pure JavaScript |
 | `cheerio` | HTML parsing |
-| `zod` | Input validation |
+| `zod` (v4) | Input and output validation |
 | `typescript` | Build tooling |
+| `vitest` | Test runner |
+| `@biomejs/biome` | Linting and formatting |
 
 ## Notes
 

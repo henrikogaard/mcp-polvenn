@@ -138,11 +138,23 @@ export interface ExternalRelease {
   items: ExternalReleaseItem[];
 }
 
+/** Watchlist rule types. String rules match by substring; abv/price rules match numeric bounds. */
+export type WatchlistRuleType =
+  | "brewery"
+  | "style"
+  | "series"
+  | "keyword"
+  | "country"
+  | "abv"
+  | "price";
+
 /** Watchlist entry stored in local DB */
 export interface WatchlistEntry {
   id: number;
-  type: "brewery" | "style" | "series" | "keyword";
+  type: WatchlistRuleType;
   value: string;
+  minValue?: number | null;
+  maxValue?: number | null;
   createdAt: string;
 }
 

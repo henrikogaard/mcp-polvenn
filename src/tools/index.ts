@@ -1,42 +1,61 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { MAX_LIMIT, PRIMARY_TOOL_PREFIX } from "../constants.js";
-import type {
-  ExternalRelease,
-  WatchlistEntry,
-  WatchlistMatch,
-} from "../types.js";
+import type { z } from "zod";
+import { MAX_LIMIT } from "../constants.js";
 import {
-  SearchNewBeersSchema,
-  UpcomingBeersSchema,
-  NewBeersNearStoreSchema,
+  addWatchlistEntry,
+  getAllConfig,
+  getConfigValue,
+  getSeenWatchlistMatchKeys,
+  listWatchlistEntries,
+  removeWatchlistEntry,
+  setConfig,
+  setSeenWatchlistMatchKeys,
+} from "../db/database.js";
+import {
+  CheckStoreStockOutputSchema,
+  ConfigureOutputSchema,
+  FindNearbyStoresOutputSchema,
+  GetProductOutputSchema,
+  SearchNewBeersNearStoreOutputSchema,
+  SearchNewBeersOutputSchema,
+  SearchProductsOutputSchema,
+  SearchUpcomingBeersOutputSchema,
+  ValidateConfigOutputSchema,
+  WatchlistOutputSchema,
+} from "../schemas/output.js";
+import {
   CheckStoreStockSchema,
-  FindNearbyStoresSchema,
-  WatchlistSchema,
   ConfigureSchema,
+  FindNearbyStoresSchema,
+  GetProductSchema,
+  NewBeersNearStoreSchema,
+  SearchNewBeersSchema,
+  SearchProductsSchema,
+  UpcomingBeersSchema,
   ValidateConfigSchema,
+  WatchlistSchema,
 } from "../schemas/tools.js";
+import * as releaseFeed from "../services/release-feed.js";
 import * as vinmonopolet from "../services/vinmonopolet.js";
 import {
+  formatNumericRuleValue,
   getWatchlistMatchKey,
   matchWatchlistEntries,
   splitWatchlistMatches,
 } from "../services/watchlist.js";
-import * as releaseFeed from "../services/release-feed.js";
-import {
-  addWatchlistEntry,
-  getSeenWatchlistMatchKeys,
-  removeWatchlistEntry,
-  listWatchlistEntries,
-  setSeenWatchlistMatchKeys,
-  setConfig,
-  getAllConfig,
-  getConfigValue,
-} from "../db/database.js";
+import type {
+  ExternalRelease,
+  VinmonopoletProduct,
+  WatchlistEntry,
+  WatchlistMatch,
+} from "../types.js";
 
 export function registerAllTools(server: McpServer): void {
   registerSearchNewBeers(server);
   registerSearchUpcomingBeers(server);
   registerSearchNewBeersNearStore(server);
+  registerSearchProducts(server);
+  registerGetProduct(server);
   registerCheckStoreStock(server);
   registerFindNearbyStores(server);
   registerWatchlist(server);
@@ -44,17 +63,18 @@ export function registerAllTools(server: McpServer): void {
   registerValidateConfig(server);
 }
 
-function registerToolWithAliases(
-  nameSuffix: string,
-  register: (toolName: string) => void,
-): void {
-  register(`${PRIMARY_TOOL_PREFIX}_${nameSuffix}`);
+const WATCHLIST_RESOURCE_URI = "polvenn://watchlist";
+
+function notifyWatchlistUpdated(server: McpServer): void {
+  // Advisory only — relevant for clients that subscribed to the watchlist
+  // resource. Never let a notification failure break a tool response.
+  server.server.sendResourceUpdated({ uri: WATCHLIST_RESOURCE_URI }).catch(() => {});
 }
 
-function createToolResult(structuredContent: Record<string, unknown>, text: string) {
+function createToolResult<T>(schema: z.ZodType<T>, payload: unknown, text: string) {
   return {
     content: [{ type: "text" as const, text }],
-    structuredContent,
+    structuredContent: schema.parse(payload),
   };
 }
 
@@ -126,7 +146,8 @@ export function mergeBeerSearchResults(
     country: existing.country ?? incoming.country,
     sources: [...new Set([...existing.sources, ...incoming.sources])],
     releaseDate: existing.releaseDate ?? incoming.releaseDate,
-    vinmonopoletLastChangedAt: existing.vinmonopoletLastChangedAt ?? incoming.vinmonopoletLastChangedAt,
+    vinmonopoletLastChangedAt:
+      existing.vinmonopoletLastChangedAt ?? incoming.vinmonopoletLastChangedAt,
     vinmonopoletStatus: existing.vinmonopoletStatus ?? incoming.vinmonopoletStatus,
   };
 }
@@ -179,7 +200,8 @@ function mapVinmonopoletBeerToSearchResult(
     country: vinmonopolet.getProductCountry(beer) ?? undefined,
     releaseDate: null,
     vinmonopoletLastChangedAt: vinmonopolet.getProductLastChangedAt(beer),
-    vinmonopoletStatus: beer.availability?.status ?? (source === "vinmonopolet_upcoming" ? "kommende" : null),
+    vinmonopoletStatus:
+      beer.availability?.status ?? (source === "vinmonopolet_upcoming" ? "kommende" : null),
   };
 }
 
@@ -222,9 +244,7 @@ function getSearchDateKey(value: string): string | null {
     return isoDateMatch[1];
   }
 
-  const norwegianMatch = trimmed
-    .toLowerCase()
-    .match(/^(\d{1,2})\.\s*([a-zæøå]+)\s*(\d{4})$/i);
+  const norwegianMatch = trimmed.toLowerCase().match(/^(\d{1,2})\.\s*([a-zæøå]+)\s*(\d{4})$/i);
   if (!norwegianMatch) {
     return null;
   }
@@ -240,8 +260,10 @@ function getSearchDateKey(value: string): string | null {
 }
 
 export function getBeerSearchResultTimestamp(beer: BeerSearchResult): number | null {
-  return parseSearchResultDate(beer.releaseDate ?? "")
-    ?? parseSearchResultDate(beer.vinmonopoletLastChangedAt ?? "");
+  return (
+    parseSearchResultDate(beer.releaseDate ?? "") ??
+    parseSearchResultDate(beer.vinmonopoletLastChangedAt ?? "")
+  );
 }
 
 export function filterBeerSearchResultsSince(
@@ -273,8 +295,9 @@ export function filterBeerSearchResultsByReleaseDate(
   }
 
   return beers.filter((beer) => {
-    const resultDateKey = getSearchDateKey(beer.releaseDate ?? "")
-      ?? getSearchDateKey(beer.vinmonopoletLastChangedAt ?? "");
+    const resultDateKey =
+      getSearchDateKey(beer.releaseDate ?? "") ??
+      getSearchDateKey(beer.vinmonopoletLastChangedAt ?? "");
     return resultDateKey === targetDateKey;
   });
 }
@@ -310,7 +333,9 @@ async function resolveStoreContext(requestedStoreId?: string): Promise<ResolvedS
   if (configuredStoreId) {
     const store = await vinmonopolet.getStoreById(configuredStoreId);
     if (!store) {
-      throw new Error(`Configured home store ${configuredStoreId} was not found in Vinmonopolet's store list.`);
+      throw new Error(
+        `Configured home store ${configuredStoreId} was not found in Vinmonopolet's store list.`,
+      );
     }
 
     return {
@@ -320,8 +345,10 @@ async function resolveStoreContext(requestedStoreId?: string): Promise<ResolvedS
     };
   }
 
-  const lat = await getConfigValue("home_latitude").then((value) => value ? Number(value) : null);
-  const lon = await getConfigValue("home_longitude").then((value) => value ? Number(value) : null);
+  const lat = await getConfigValue("home_latitude").then((value) => (value ? Number(value) : null));
+  const lon = await getConfigValue("home_longitude").then((value) =>
+    value ? Number(value) : null,
+  );
   if (lat == null || lon == null) {
     throw new Error(
       "No store specified and no home store/home location configured. Use polvenn_configure to set a home store or home coordinates, or pass a storeId.",
@@ -330,7 +357,9 @@ async function resolveStoreContext(requestedStoreId?: string): Promise<ResolvedS
 
   const [nearestStore] = await vinmonopolet.findNearbyStores(lat, lon, 1);
   if (!nearestStore) {
-    throw new Error("Could not resolve a nearby Vinmonopolet store from your configured home location.");
+    throw new Error(
+      "Could not resolve a nearby Vinmonopolet store from your configured home location.",
+    );
   }
 
   return {
@@ -368,14 +397,11 @@ function applyBeerSearchFilters(
 }
 
 function registerSearchNewBeers(server: McpServer): void {
-  registerToolWithAliases(
-    "search_new_beers",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Search new beers",
-          description: `Search for recently released beers on Vinmonopolet via the official API and/or your external release feed.
+  server.registerTool(
+    "polvenn_search_new_beers",
+    {
+      title: "Search new beers",
+      description: `Search for recently released beers on Vinmonopolet via the official API and/or your external release feed.
 
 Args:
   - source ('vinmonopolet' | 'external' | 'both'): Where to search (default: 'both')
@@ -387,22 +413,26 @@ Args:
   - limit (number): Max results (default: 25)
 
 Returns: List of new beers with name, producer, style, ABV, article number, and release date.`,
-          inputSchema: SearchNewBeersSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
+      inputSchema: SearchNewBeersSchema,
+      outputSchema: SearchNewBeersOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
         if (params.storeId && params.source === "external") {
-          return createToolError("storeId filtering requires source='vinmonopolet' or source='both'. The external release feed alone cannot confirm store availability.");
+          return createToolError(
+            "storeId filtering requires source='vinmonopolet' or source='both'. The external release feed alone cannot confirm store availability.",
+          );
         }
 
-        const since = params.since
-          ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+        const since =
+          params.since ??
+          new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
         const resolvedStore = params.storeId ? await resolveStoreContext(params.storeId) : null;
         const includeUpcoming = params.includeUpcoming && resolvedStore == null;
 
@@ -415,7 +445,10 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
           for (const beer of beers) {
             const next = mergeBeerSearchResults(
               resultMap.get(beer.basic.productId),
-              mapVinmonopoletBeerToSearchResult(beer, resolvedStore ? "vinmonopolet_store" : "vinmonopolet"),
+              mapVinmonopoletBeerToSearchResult(
+                beer,
+                resolvedStore ? "vinmonopolet_store" : "vinmonopolet",
+              ),
             );
             resultMap.set(beer.basic.productId, next);
           }
@@ -456,7 +489,9 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
         }
 
         if (params.releaseDate && !getSearchDateKey(params.releaseDate)) {
-          return createToolError("releaseDate must be yyyy-MM-dd or a Norwegian date like '1. april 2026'.");
+          return createToolError(
+            "releaseDate must be yyyy-MM-dd or a Norwegian date like '1. april 2026'.",
+          );
         }
 
         const results = Array.from(resultMap.values());
@@ -476,12 +511,14 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
             ? "Upcoming beers were skipped because Vinmonopolet's upcoming listing is not store-specific."
             : null,
         ].filter((part): part is string => part != null);
-        const body = limited.length === 0
-          ? `No new beers found since ${since}${params.style ? ` matching style '${params.style}'` : ""}${params.releaseDate ? ` on '${params.releaseDate}'` : ""}.`
-          : limited.map(formatBeerSearchResult).join("\n\n");
+        const body =
+          limited.length === 0
+            ? `No new beers found since ${since}${params.style ? ` matching style '${params.style}'` : ""}${params.releaseDate ? ` on '${params.releaseDate}'` : ""}.`
+            : limited.map(formatBeerSearchResult).join("\n\n");
         const text = textPrefix.length > 0 ? `${textPrefix.join("\n")}\n\n${body}` : body;
 
         return createToolResult(
+          SearchNewBeersOutputSchema,
           {
             source: params.source,
             since,
@@ -496,53 +533,53 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Error searching for new beers: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Error searching for new beers: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerSearchUpcomingBeers(server: McpServer): void {
-  registerToolWithAliases(
-    "search_upcoming_beers",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Search upcoming beers",
-          description: `Search Vinmonopolet's "Kommende nyheter" web listing for upcoming beer releases.
+  server.registerTool(
+    "polvenn_search_upcoming_beers",
+    {
+      title: "Search upcoming beers",
+      description: `Search Vinmonopolet's "Kommende nyheter" web listing for upcoming beer releases.
 
 Args:
   - style (string, optional): Filter by beer style, e.g. 'IPA', 'Stout'
   - limit (number): Max results (default: 25)
 
 Returns: List of upcoming beers with name, producer, style, ABV, article number, and current website status.`,
-          inputSchema: UpcomingBeersSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
+      inputSchema: UpcomingBeersSchema,
+      outputSchema: SearchUpcomingBeersOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
         const beers = await vinmonopolet.getUpcomingBeers(params.limit);
-        const results = beers.map((beer) => mapVinmonopoletBeerToSearchResult(beer, "vinmonopolet_upcoming"));
+        const results = beers.map((beer) =>
+          mapVinmonopoletBeerToSearchResult(beer, "vinmonopolet_upcoming"),
+        );
         const styleFilter = params.style?.toLowerCase();
         const filtered = styleFilter
           ? results.filter((beer) => beer.style.toLowerCase().includes(styleFilter))
           : results;
         const limited = filtered.slice(0, params.limit);
 
-        const text = limited.length === 0
-          ? `No upcoming beers found${params.style ? ` matching style '${params.style}'` : ""}.`
-          : limited.map(formatBeerSearchResult).join("\n\n");
+        const text =
+          limited.length === 0
+            ? `No upcoming beers found${params.style ? ` matching style '${params.style}'` : ""}.`
+            : limited.map(formatBeerSearchResult).join("\n\n");
 
         return createToolResult(
+          SearchUpcomingBeersOutputSchema,
           {
             style: params.style ?? null,
             totalResults: filtered.length,
@@ -550,24 +587,19 @@ Returns: List of upcoming beers with name, producer, style, ABV, article number,
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Error searching for upcoming beers: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Error searching for upcoming beers: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerSearchNewBeersNearStore(server: McpServer): void {
-  registerToolWithAliases(
-    "search_new_beers_near_store",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Search new beers near your store",
-          description: `Search Vinmonopolet's current "Nyheter" listing for beers available in one store.
+  server.registerTool(
+    "polvenn_search_new_beers_near_store",
+    {
+      title: "Search new beers near your store",
+      description: `Search Vinmonopolet's current "Nyheter" listing for beers available in one store.
 
 Args:
   - storeId (string, optional): Store ID. Falls back to your configured home store, then your nearest store from your home coordinates
@@ -576,18 +608,21 @@ Args:
   - limit (number): Max results (default: 25)
 
 Returns: New beers currently available in the selected store, enriched with external release dates when recent feed items match.`,
-          inputSchema: NewBeersNearStoreSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
+      inputSchema: NewBeersNearStoreSchema,
+      outputSchema: SearchNewBeersNearStoreOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
         if (params.releaseDate && !getSearchDateKey(params.releaseDate)) {
-          return createToolError("releaseDate must be yyyy-MM-dd or a Norwegian date like '1. april 2026'.");
+          return createToolError(
+            "releaseDate must be yyyy-MM-dd or a Norwegian date like '1. april 2026'.",
+          );
         }
 
         const resolvedStore = await resolveStoreContext(params.storeId);
@@ -635,13 +670,17 @@ Returns: New beers currently available in the selected store, enriched with exte
           resolvedStore.resolution === "nearest_home_location" && resolvedStore.distanceKm != null
             ? `Resolved from your home coordinates (${resolvedStore.distanceKm.toFixed(1)} km away).`
             : null,
-        ].filter((part): part is string => part != null).join("\n");
+        ]
+          .filter((part): part is string => part != null)
+          .join("\n");
 
-        const body = limited.length === 0
-          ? `No new beers found for this store${params.style ? ` matching style '${params.style}'` : ""}${params.releaseDate ? ` on '${params.releaseDate}'` : ""}.`
-          : limited.map(formatBeerSearchResult).join("\n\n");
+        const body =
+          limited.length === 0
+            ? `No new beers found for this store${params.style ? ` matching style '${params.style}'` : ""}${params.releaseDate ? ` on '${params.releaseDate}'` : ""}.`
+            : limited.map(formatBeerSearchResult).join("\n\n");
 
         return createToolResult(
+          SearchNewBeersNearStoreOutputSchema,
           {
             store: resolvedStore,
             style: params.style ?? null,
@@ -651,41 +690,39 @@ Returns: New beers currently available in the selected store, enriched with exte
           },
           `${intro}\n\n${body}`,
         );
-          } catch (error: unknown) {
-            return createToolError(`Error searching for new beers near store: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(
+          `Error searching for new beers near store: ${(error as Error).message}`,
+        );
+      }
     },
   );
 }
 
 function registerCheckStoreStock(server: McpServer): void {
-  registerToolWithAliases(
-    "check_store_stock",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Check store stock",
-          description: `Check if a specific beer is in stock at a Vinmonopolet store.
+  server.registerTool(
+    "polvenn_check_store_stock",
+    {
+      title: "Check store stock",
+      description: `Check if a specific beer is in stock at a Vinmonopolet store.
 
 Args:
   - articleNumber (string): Vinmonopolet article number
   - storeId (string, optional): Store ID. Defaults to your configured home store.
 
 Returns: Stock status and product details.`,
-          inputSchema: CheckStoreStockSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
-        const storeId = params.storeId ?? await getConfigValue("home_store_id");
+      inputSchema: CheckStoreStockSchema,
+      outputSchema: CheckStoreStockOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const storeId = params.storeId ?? (await getConfigValue("home_store_id"));
         if (!storeId) {
           return createToolError(
             "No store specified and no home store configured. Use polvenn_configure to set a home store, or pass a storeId.",
@@ -697,7 +734,9 @@ Returns: Stock status and product details.`,
           vinmonopolet.checkStoreStock(params.articleNumber, storeId),
         ]);
 
-        const productName = product ? vinmonopolet.getProductName(product) : `Article ${params.articleNumber}`;
+        const productName = product
+          ? vinmonopolet.getProductName(product)
+          : `Article ${params.articleNumber}`;
         const producer = product ? vinmonopolet.getProductProducer(product) : null;
         const style = product ? vinmonopolet.getProductStyle(product) : null;
         const availability = product?.availability;
@@ -727,11 +766,14 @@ Returns: Stock status and product details.`,
           if (detailParts.length > 0) {
             text += `\n\n${detailParts.join(" | ")}`;
           }
-          text += "\n\nImportant: this is **not** an out-of-stock result. Website metadata such as selection, buyable status, or product page status must not be treated as verified store stock.";
-          text += "\n\nTry the product page or another client with stock access if you need store-level confirmation.";
+          text +=
+            "\n\nImportant: this is **not** an out-of-stock result. Website metadata such as selection, buyable status, or product page status must not be treated as verified store stock.";
+          text +=
+            "\n\nTry the product page or another client with stock access if you need store-level confirmation.";
         }
 
         return createToolResult(
+          CheckStoreStockOutputSchema,
           {
             articleNumber: params.articleNumber,
             storeId,
@@ -742,39 +784,36 @@ Returns: Stock status and product details.`,
             stockLevel: stockCheck.stockLevel,
             storeStockConclusion: stockCheck.storeStockConclusion,
             stockSource: stockCheck.stockSource,
-            inStock: stockCheck.storeStockConclusion === "in_stock"
-              ? true
-              : stockCheck.storeStockConclusion === "out_of_stock"
-                ? false
-                : null,
+            inStock:
+              stockCheck.storeStockConclusion === "in_stock"
+                ? true
+                : stockCheck.storeStockConclusion === "out_of_stock"
+                  ? false
+                  : null,
             websiteAvailabilityIsStoreStock: stockCheck.websiteAvailabilityIsStoreStock,
-            assistantGuidance: stockCheck.status === "verified"
-              ? stockCheck.stockSource === "website_stock_locator"
-                ? "You may report the verified store stock result directly. This was verified via vinmonopolet.no's store stock locator, not inferred from generic product page metadata."
-                : "You may report the verified store stock result directly."
-              : "Do not say the product is out of stock. The correct conclusion is that store-level stock is unknown.",
+            assistantGuidance:
+              stockCheck.status === "verified"
+                ? stockCheck.stockSource === "website_stock_locator"
+                  ? "You may report the verified store stock result directly. This was verified via vinmonopolet.no's store stock locator, not inferred from generic product page metadata."
+                  : "You may report the verified store stock result directly."
+                : "Do not say the product is out of stock. The correct conclusion is that store-level stock is unknown.",
             availability: availability ?? null,
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Error checking stock: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Error checking stock: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerFindNearbyStores(server: McpServer): void {
-  registerToolWithAliases(
-    "find_nearby_stores",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Find nearby Vinmonopolet stores",
-          description: `Find the closest Vinmonopolet stores to a given location.
+  server.registerTool(
+    "polvenn_find_nearby_stores",
+    {
+      title: "Find nearby Vinmonopolet stores",
+      description: `Find the closest Vinmonopolet stores to a given location.
 
 Args:
   - latitude (number, optional): Defaults to configured home location
@@ -782,18 +821,23 @@ Args:
   - maxResults (number): How many stores to return (default: 5)
 
 Returns: List of nearby stores with address, distance, category, and opening hours.`,
-          inputSchema: FindNearbyStoresSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
-        const lat = params.latitude ?? (await getConfigValue("home_latitude").then((value) => value ? Number(value) : null));
-        const lon = params.longitude ?? (await getConfigValue("home_longitude").then((value) => value ? Number(value) : null));
+      inputSchema: FindNearbyStoresSchema,
+      outputSchema: FindNearbyStoresOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const lat =
+          params.latitude ??
+          (await getConfigValue("home_latitude").then((value) => (value ? Number(value) : null)));
+        const lon =
+          params.longitude ??
+          (await getConfigValue("home_longitude").then((value) => (value ? Number(value) : null)));
 
         if (lat == null || lon == null) {
           return createToolError(
@@ -804,11 +848,14 @@ Returns: List of nearby stores with address, distance, category, and opening hou
         const maxResults = params.maxResults ?? 5;
         const stores = await vinmonopolet.findNearbyStores(lat, lon, maxResults);
         const text = stores
-          .map((store, index) =>
-            `${index + 1}. **${store.storeName}** (${store.distanceKm.toFixed(1)} km)\n   ${store.address.street}, ${store.address.postalCode} ${store.address.city}\n   Category: ${store.category} | ID: ${store.storeId}`)
+          .map(
+            (store, index) =>
+              `${index + 1}. **${store.storeName}** (${store.distanceKm.toFixed(1)} km)\n   ${store.address.street}, ${store.address.postalCode} ${store.address.city}\n   Category: ${store.category} | ID: ${store.storeId}`,
+          )
           .join("\n\n");
 
         return createToolResult(
+          FindNearbyStoresOutputSchema,
           {
             latitude: lat,
             longitude: lon,
@@ -817,57 +864,293 @@ Returns: List of nearby stores with address, distance, category, and opening hou
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Error finding stores: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Error finding stores: ${(error as Error).message}`);
+      }
+    },
+  );
+}
+
+interface ProductSummary {
+  articleNumber: string;
+  name: string;
+  producer: string | null;
+  style: string | null;
+  category: string | null;
+  abv: number | null;
+  volume: number | null;
+  price: number | null;
+  country: string | null;
+  status: string | null;
+  productPageUrl: string | null;
+}
+
+function toProductSummary(product: VinmonopoletProduct): ProductSummary {
+  return {
+    articleNumber: product.basic.productId,
+    name: vinmonopolet.getProductName(product),
+    producer: vinmonopolet.getProductProducer(product),
+    style: vinmonopolet.getProductStyle(product),
+    category: product.classification?.mainProductTypeName ?? null,
+    abv: vinmonopolet.getProductAbv(product),
+    volume: product.basic.volume ?? null,
+    price: product.prices?.salesPrice ?? null,
+    country: vinmonopolet.getProductCountry(product),
+    status: product.availability?.status ?? product.basic.productStatusSaleName ?? null,
+    productPageUrl: product.availability?.productPageUrl ?? null,
+  };
+}
+
+function formatProductSummary(product: ProductSummary, index: number): string {
+  const metadata = [
+    product.producer,
+    product.style,
+    product.category !== product.style ? product.category : null,
+    product.abv != null ? `${product.abv}%` : null,
+    product.volume != null ? `${product.volume} ml` : null,
+    product.price != null ? `${product.price} kr` : null,
+    product.country,
+    product.status,
+    `Art.nr: ${product.articleNumber}`,
+  ].filter((part): part is string => part != null);
+
+  return `${index + 1}. **${product.name}**\n   ${metadata.join(" | ")}`;
+}
+
+function registerSearchProducts(server: McpServer): void {
+  server.registerTool(
+    "polvenn_search_products",
+    {
+      title: "Search Vinmonopolet products",
+      description: `Search Vinmonopolet's full product catalogue by name or article number (not limited to beer).
+
+Args:
+  - query (string): Product name, partial name, or exact article number
+  - beerOnly (boolean): Only return beers (default: false)
+  - limit (number): Max results (default: 25)
+
+Returns: Matching products with producer, style, ABV, volume, price, and country.`,
+      inputSchema: SearchProductsSchema,
+      outputSchema: SearchProductsOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const products = await vinmonopolet.searchProducts(params.query, MAX_LIMIT);
+        const filtered = params.beerOnly ? products.filter(vinmonopolet.isBeer) : products;
+        const limited = filtered.slice(0, params.limit);
+        const results = limited.map(toProductSummary);
+
+        const text =
+          results.length === 0
+            ? `No products found for '${params.query}'${params.beerOnly ? " (beers only)" : ""}.`
+            : results.map(formatProductSummary).join("\n\n");
+
+        return createToolResult(
+          SearchProductsOutputSchema,
+          {
+            query: params.query,
+            beerOnly: params.beerOnly,
+            totalResults: filtered.length,
+            results,
+          },
+          text,
+        );
+      } catch (error: unknown) {
+        return createToolError(`Error searching products: ${(error as Error).message}`);
+      }
+    },
+  );
+}
+
+function registerGetProduct(server: McpServer): void {
+  server.registerTool(
+    "polvenn_get_product",
+    {
+      title: "Get product details",
+      description: `Get full details for one Vinmonopolet product by article number.
+
+Args:
+  - articleNumber (string): Vinmonopolet article number (e.g. '20537202')
+
+Returns: Name, producer, style, country, ABV, volume, price, availability, and tasting notes when available.`,
+      inputSchema: GetProductSchema,
+      outputSchema: GetProductOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const product = await vinmonopolet.getProductById(params.articleNumber);
+
+        if (!product) {
+          return createToolResult(
+            GetProductOutputSchema,
+            {
+              articleNumber: params.articleNumber,
+              found: false,
+              product: null,
+            },
+            `No product was found for article number ${params.articleNumber} on Vinmonopolet.`,
+          );
+        }
+
+        const characteristics = product.description?.characteristics;
+        const productDetail = {
+          name: vinmonopolet.getProductName(product),
+          longName: product.basic.productLongName ?? null,
+          producer: vinmonopolet.getProductProducer(product),
+          style: vinmonopolet.getProductStyle(product),
+          category: product.classification?.mainProductTypeName ?? null,
+          country: vinmonopolet.getProductCountry(product),
+          abv: vinmonopolet.getProductAbv(product),
+          volume: product.basic.volume ?? null,
+          vintage: product.basic.vintage ?? null,
+          ageLimit: product.basic.ageLimit ?? null,
+          price: product.prices?.salesPrice ?? null,
+          pricePerLiter: product.prices?.salesPricePrLiter ?? null,
+          status: product.availability?.status ?? product.basic.productStatusSaleName ?? null,
+          productSelection: product.availability?.productSelection ?? null,
+          buyable: product.availability?.buyable ?? null,
+          wholesaler: product.logistics?.wholesalerName ?? null,
+          colour: characteristics?.colour ?? null,
+          odour: characteristics?.odour ?? null,
+          taste: characteristics?.taste ?? null,
+          productPageUrl:
+            product.availability?.productPageUrl ??
+            `https://www.vinmonopolet.no/p/${product.basic.productId}`,
+          lastChangedAt: vinmonopolet.getProductLastChangedAt(product),
+        };
+
+        const lines = [
+          `**${productDetail.name}**`,
+          [
+            productDetail.producer,
+            productDetail.category,
+            productDetail.style,
+            productDetail.country,
+          ]
+            .filter((part): part is string => part != null)
+            .join(" | "),
+          [
+            productDetail.abv != null ? `${productDetail.abv}% ABV` : null,
+            productDetail.volume != null ? `${productDetail.volume} ml` : null,
+            productDetail.price != null ? `${productDetail.price} kr` : null,
+            productDetail.productSelection,
+            productDetail.status,
+          ]
+            .filter((part): part is string => part != null)
+            .join(" | "),
+        ];
+
+        const tasting = [productDetail.colour, productDetail.odour, productDetail.taste].filter(
+          (part): part is string => part != null,
+        );
+        if (tasting.length > 0) {
+          lines.push(tasting.join("\n"));
+        }
+        lines.push(productDetail.productPageUrl ?? "");
+
+        return createToolResult(
+          GetProductOutputSchema,
+          {
+            articleNumber: params.articleNumber,
+            found: true,
+            product: productDetail,
+          },
+          lines.filter(Boolean).join("\n"),
+        );
+      } catch (error: unknown) {
+        return createToolError(`Error fetching product: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerWatchlist(server: McpServer): void {
-  registerToolWithAliases(
-    "watchlist",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Beer watchlist",
-          description: `Manage your beer watchlist. Track breweries, styles, series, or keywords to get notified about matching releases.
+  server.registerTool(
+    "polvenn_watchlist",
+    {
+      title: "Beer watchlist",
+      description: `Manage your beer watchlist. Track breweries, styles, series, keywords, countries, or ABV/price ranges to get notified about matching releases.
 
 Args:
   - action ('add' | 'remove' | 'list' | 'check'): What to do
-  - type ('brewery' | 'style' | 'series' | 'keyword'): Rule type (required for 'add')
-  - value (string): What to watch for (required for 'add')
-  - id (number): Entry ID to remove (required for 'remove')`,
-          inputSchema: WatchlistSchema,
-          annotations: {
-            readOnlyHint: false,
-            destructiveHint: false,
-            idempotentHint: false,
-            openWorldHint: true,
-          },
-        },
-        async (params) => {
-          try {
+  - type ('brewery' | 'style' | 'series' | 'keyword' | 'country' | 'abv' | 'price'): Rule type (required for 'add')
+  - value (string): What to watch for (required for text rules; derived for abv/price)
+  - minValue / maxValue (number): Bounds for 'abv'/'price' rules (at least one required)
+  - id (number): Entry ID to remove (required for 'remove')
+
+Note: price rules are best-effort — prices are looked up via Vinmonopolet and reported as not evaluated when unavailable.`,
+      inputSchema: WatchlistSchema,
+      outputSchema: WatchlistOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
         switch (params.action) {
           case "add": {
-            if (!params.type || !params.value) {
-              return createToolError("Both 'type' and 'value' are required for 'add' action.");
+            if (!params.type) {
+              return createToolError("'type' is required for 'add' action.");
             }
-            const entry = await addWatchlistEntry(params.type, params.value);
-            return createToolResult({ action: "add", entry }, `Added watchlist rule #${entry.id}: ${entry.type} = "${entry.value}"`);
+
+            let value: string;
+            let minValue: number | undefined;
+            let maxValue: number | undefined;
+
+            if (params.type === "abv" || params.type === "price") {
+              if (params.minValue === undefined && params.maxValue === undefined) {
+                return createToolError(
+                  `Rules of type '${params.type}' need minValue and/or maxValue.`,
+                );
+              }
+              minValue = params.minValue;
+              maxValue = params.maxValue;
+              value = formatNumericRuleValue(params.type, minValue, maxValue);
+            } else {
+              if (!params.value) {
+                return createToolError("'value' is required for 'add' action with text rules.");
+              }
+              value = params.value;
+            }
+
+            const entry = await addWatchlistEntry(params.type, value, minValue, maxValue);
+            notifyWatchlistUpdated(server);
+            return createToolResult(
+              WatchlistOutputSchema,
+              { action: "add", entry },
+              `Added watchlist rule #${entry.id}: ${entry.type} = "${entry.value}"`,
+            );
           }
 
           case "remove": {
             if (params.id === undefined) {
-              return createToolError("'id' is required for 'remove' action. Use 'list' to see IDs.");
+              return createToolError(
+                "'id' is required for 'remove' action. Use 'list' to see IDs.",
+              );
             }
             const removed = await removeWatchlistEntry(params.id);
+            notifyWatchlistUpdated(server);
             return createToolResult(
+              WatchlistOutputSchema,
               { action: "remove", id: params.id, removed },
-              removed ? `Removed watchlist rule #${params.id}.` : `No rule found with ID ${params.id}.`,
+              removed
+                ? `Removed watchlist rule #${params.id}.`
+                : `No rule found with ID ${params.id}.`,
             );
           }
 
@@ -875,16 +1158,21 @@ Args:
             const entries = await listWatchlistEntries();
             if (entries.length === 0) {
               return createToolResult(
+                WatchlistOutputSchema,
                 { action: "list", entries: [], totalRules: 0 },
                 "Your watchlist is empty. Use action='add' to add rules.",
               );
             }
 
             const text = entries
-              .map((entry: WatchlistEntry) => `#${entry.id} [${entry.type}] "${entry.value}" (added ${entry.createdAt})`)
+              .map(
+                (entry: WatchlistEntry) =>
+                  `#${entry.id} [${entry.type}] "${entry.value}" (added ${entry.createdAt})`,
+              )
               .join("\n");
 
             return createToolResult(
+              WatchlistOutputSchema,
               { action: "list", entries, totalRules: entries.length },
               `**Your watchlist:**\n${text}`,
             );
@@ -894,7 +1182,14 @@ Args:
             const entries = await listWatchlistEntries();
             if (entries.length === 0) {
               return createToolResult(
-                { action: "check", totalRules: 0, totalBeers: 0, newMatches: [], repeatedMatches: [] },
+                WatchlistOutputSchema,
+                {
+                  action: "check",
+                  totalRules: 0,
+                  totalBeers: 0,
+                  newMatches: [],
+                  repeatedMatches: [],
+                },
                 "Your watchlist is empty. Nothing to check.",
               );
             }
@@ -903,32 +1198,80 @@ Args:
 
             if (!latestRelease) {
               return createToolResult(
-                { action: "check", totalRules: entries.length, totalBeers: 0, release: null, newMatches: [], repeatedMatches: [] },
+                WatchlistOutputSchema,
+                {
+                  action: "check",
+                  totalRules: entries.length,
+                  totalBeers: 0,
+                  release: null,
+                  newMatches: [],
+                  repeatedMatches: [],
+                },
                 "No releases were found in the external release feed to check against.",
               );
             }
 
             const beers = latestRelease.items;
-            const matches = matchWatchlistEntries(beers, entries);
+
+            // Price rules need per-beer prices, which only Vinmonopolet knows.
+            // Resolve them up front (cached products make this cheap) so we can
+            // honestly report how many beers price rules could not be evaluated for.
+            const hasPriceRules = entries.some((entry) => entry.type === "price");
+            let unevaluatedPriceBeers = 0;
+            let resolvePrice: ((articleNumber: string) => Promise<number | null>) | undefined;
+
+            if (hasPriceRules) {
+              const prices = new Map<string, number | null>();
+              for (const beer of beers) {
+                try {
+                  const product = await vinmonopolet.getProductById(beer.articleNumber);
+                  prices.set(beer.articleNumber, product?.prices?.salesPrice ?? null);
+                } catch {
+                  prices.set(beer.articleNumber, null);
+                }
+              }
+              unevaluatedPriceBeers = Array.from(prices.values()).filter(
+                (price) => price == null,
+              ).length;
+              resolvePrice = async (articleNumber) => prices.get(articleNumber) ?? null;
+            }
+
+            const matches = await matchWatchlistEntries(beers, entries, { resolvePrice });
             const seenMatchKeys = await getSeenWatchlistMatchKeys(latestRelease.id);
             const { newMatches, repeatedMatches } = splitWatchlistMatches(matches, seenMatchKeys);
 
-            await setSeenWatchlistMatchKeys(
-              latestRelease.id,
-              [...seenMatchKeys, ...matches.map(getWatchlistMatchKey)],
-            );
+            await setSeenWatchlistMatchKeys(latestRelease.id, [
+              ...seenMatchKeys,
+              ...matches.map(getWatchlistMatchKey),
+            ]);
 
             if (matches.length === 0) {
+              const noMatchText = `Checked ${beers.length} beers from latest release — no matches for your ${entries.length} rules.`;
               return createToolResult(
-                { action: "check", release: latestRelease, totalRules: entries.length, totalBeers: beers.length, totalMatches: 0, newMatches: [], repeatedMatches: [] },
-                `Checked ${beers.length} beers from latest release — no matches for your ${entries.length} rules.`,
+                WatchlistOutputSchema,
+                {
+                  action: "check",
+                  release: latestRelease,
+                  totalRules: entries.length,
+                  totalBeers: beers.length,
+                  totalMatches: 0,
+                  unevaluatedPriceBeers,
+                  newMatches: [],
+                  repeatedMatches: [],
+                },
+                unevaluatedPriceBeers > 0
+                  ? `${noMatchText}\n\nNote: price rules could not be evaluated for ${unevaluatedPriceBeers} beer(s) with unknown prices.`
+                  : noMatchText,
               );
             }
 
-            const formatMatches = (items: WatchlistMatch[]) => items
-              .map((match: WatchlistMatch, index) =>
-                `${index + 1}. **${match.beer.name}** (${match.beer.producer})\n   ${match.beer.style} | ${match.beer.abv}% | Art.nr: ${match.beer.articleNumber}\n   Matched: ${match.matchedRules.map((rule) => `${rule.type}: ${rule.value}`).join(", ")}`)
-              .join("\n\n");
+            const formatMatches = (items: WatchlistMatch[]) =>
+              items
+                .map(
+                  (match: WatchlistMatch, index) =>
+                    `${index + 1}. **${match.beer.name}** (${match.beer.producer})\n   ${match.beer.style} | ${match.beer.abv}% | Art.nr: ${match.beer.articleNumber}\n   Matched: ${match.matchedRules.map((rule) => `${rule.type}: ${rule.value}`).join(", ")}`,
+                )
+                .join("\n\n");
 
             let text = `Checked ${beers.length} beers from **${latestRelease.title}**.`;
             if (newMatches.length > 0) {
@@ -941,30 +1284,39 @@ Args:
               text += `\n\nPreviously seen matches in this release: ${repeatedMatches.length}.`;
             }
 
+            if (unevaluatedPriceBeers > 0) {
+              text += `\n\nNote: price rules could not be evaluated for ${unevaluatedPriceBeers} beer(s) with unknown prices.`;
+            }
+
             return createToolResult(
-              { action: "check", release: latestRelease, totalRules: entries.length, totalBeers: beers.length, totalMatches: matches.length, newMatches, repeatedMatches },
+              WatchlistOutputSchema,
+              {
+                action: "check",
+                release: latestRelease,
+                totalRules: entries.length,
+                totalBeers: beers.length,
+                totalMatches: matches.length,
+                unevaluatedPriceBeers,
+                newMatches,
+                repeatedMatches,
+              },
               text,
             );
           }
         }
-          } catch (error: unknown) {
-            return createToolError(`Watchlist error: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Watchlist error: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerConfigure(server: McpServer): void {
-  registerToolWithAliases(
-    "configure",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Configure Polvenn",
-          description: `Set the release feed URL, API key, home store, and location for the Polvenn MCP server.
+  server.registerTool(
+    "polvenn_configure",
+    {
+      title: "Configure Polvenn",
+      description: `Set the release feed URL, API key, home store, and location for the Polvenn MCP server.
 
 Args (all optional — only provided values are updated):
   - releaseFeedUrl: Base URL for your external release feed API
@@ -974,21 +1326,25 @@ Args (all optional — only provided values are updated):
   - homeLongitude: Home longitude for nearby lookups
 
 Returns: Current configuration (keys are masked).`,
-          inputSchema: ConfigureSchema,
-          annotations: {
-            readOnlyHint: false,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: false,
-          },
-        },
-        async (params) => {
-          try {
+      inputSchema: ConfigureSchema,
+      outputSchema: ConfigureOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (params) => {
+      try {
         if (params.releaseFeedUrl) await setConfig("release_feed_url", params.releaseFeedUrl);
-        if (params.vinmonopoletApiKey) await setConfig("vinmonopolet_api_key", params.vinmonopoletApiKey);
+        if (params.vinmonopoletApiKey)
+          await setConfig("vinmonopolet_api_key", params.vinmonopoletApiKey);
         if (params.homeStoreId) await setConfig("home_store_id", params.homeStoreId);
-        if (params.homeLatitude !== undefined) await setConfig("home_latitude", String(params.homeLatitude));
-        if (params.homeLongitude !== undefined) await setConfig("home_longitude", String(params.homeLongitude));
+        if (params.homeLatitude !== undefined)
+          await setConfig("home_latitude", String(params.homeLatitude));
+        if (params.homeLongitude !== undefined)
+          await setConfig("home_longitude", String(params.homeLongitude));
 
         const config = await getAllConfig();
         const mask = (value: string | null): string => {
@@ -1006,6 +1362,7 @@ Returns: Current configuration (keys are masked).`,
         ].join("\n");
 
         return createToolResult(
+          ConfigureOutputSchema,
           {
             releaseFeedUrl: config.releaseFeedUrl,
             vinmonopoletApiKeyConfigured: config.vinmonopoletApiKey != null,
@@ -1015,24 +1372,19 @@ Returns: Current configuration (keys are masked).`,
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Config error: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Config error: ${(error as Error).message}`);
+      }
     },
   );
 }
 
 function registerValidateConfig(server: McpServer): void {
-  registerToolWithAliases(
-    "validate_config",
-    (toolName) => {
-      server.registerTool(
-        toolName,
-        {
-          title: "Validate Polvenn configuration",
-          description: `Validate current Polvenn configuration and run lightweight capability checks against upstream services.
+  server.registerTool(
+    "polvenn_validate_config",
+    {
+      title: "Validate Polvenn configuration",
+      description: `Validate current Polvenn configuration and run lightweight capability checks against upstream services.
 
 Checks:
   - local config presence
@@ -1041,16 +1393,17 @@ Checks:
   - Vinmonopolet stock endpoint accessibility
 
 Returns: A capability report with pass/warn/fail statuses.`,
-          inputSchema: ValidateConfigSchema,
-          annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-          },
-        },
-        async () => {
-          try {
+      inputSchema: ValidateConfigSchema,
+      outputSchema: ValidateConfigOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async () => {
+      try {
         const config = await getAllConfig();
         const checks: ValidationCheck[] = [];
 
@@ -1065,16 +1418,18 @@ Returns: A capability report with pass/warn/fail statuses.`,
         checks.push({
           name: "Home location",
           status: config.homeLatitude != null && config.homeLongitude != null ? "ok" : "warning",
-          message: config.homeLatitude != null && config.homeLongitude != null
-            ? `Configured as ${config.homeLatitude}, ${config.homeLongitude}.`
-            : "Not configured. Nearby store lookups need explicit coordinates unless you set them.",
+          message:
+            config.homeLatitude != null && config.homeLongitude != null
+              ? `Configured as ${config.homeLatitude}, ${config.homeLongitude}.`
+              : "Not configured. Nearby store lookups need explicit coordinates unless you set them.",
         });
 
         if (!config.releaseFeedUrl) {
           checks.push({
             name: "Release feed URL",
             status: "error",
-            message: "Missing. External release lookups and watchlist checks will fail until configured.",
+            message:
+              "Missing. External release lookups and watchlist checks will fail until configured.",
           });
           checks.push({
             name: "External release feed",
@@ -1093,9 +1448,10 @@ Returns: A capability report with pass/warn/fail statuses.`,
             checks.push({
               name: "External release feed",
               status: releases.length > 0 ? "ok" : "warning",
-              message: releases.length > 0
-                ? `Reachable. Latest release: ${releases[0].title}`
-                : "Reachable, but no releases were returned.",
+              message:
+                releases.length > 0
+                  ? `Reachable. Latest release: ${releases[0].title}`
+                  : "Reachable, but no releases were returned.",
               details: releases[0] ? { latestRelease: releases[0] } : undefined,
             });
           } catch (error: unknown) {
@@ -1213,6 +1569,7 @@ Returns: A capability report with pass/warn/fail statuses.`,
         ].join("\n");
 
         return createToolResult(
+          ValidateConfigOutputSchema,
           {
             summary,
             checks,
@@ -1226,11 +1583,9 @@ Returns: A capability report with pass/warn/fail statuses.`,
           },
           text,
         );
-          } catch (error: unknown) {
-            return createToolError(`Validation error: ${(error as Error).message}`);
-          }
-        },
-      );
+      } catch (error: unknown) {
+        return createToolError(`Validation error: ${(error as Error).message}`);
+      }
     },
   );
 }

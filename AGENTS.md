@@ -7,7 +7,7 @@ A local-first MCP (Model Context Protocol) server for tracking beer releases on 
 **Package**: `@henrikogard/polvenn-mcp-server`  
 **CLI**: `polvenn-mcp-server`  
 **Author**: Henrik  
-**Location**: `/Users/henrik/Repos/mcp-polvenn`
+**Location**: `/Users/henrik/Dev/Repos/mcp-polvenn`
 
 ---
 
@@ -15,7 +15,7 @@ A local-first MCP (Model Context Protocol) server for tracking beer releases on 
 
 This project currently focuses on:
 
-- Vinmonopolet product search
+- Vinmonopolet product search (beer releases and the full catalogue)
 - Vinmonopolet store discovery
 - Vinmonopolet stock checks
 - external release-feed lookups
@@ -30,24 +30,37 @@ This project currently focuses on:
 polvenn-mcp-server/
 ├── src/
 │   ├── index.ts              # Entry point — McpServer + stdio transport
-│   ├── constants.ts          # API base URLs, defaults, retry settings
+│   ├── constants.ts          # API base URLs, defaults, retry/timeout settings
 │   ├── types.ts              # Domain interfaces
 │   ├── sql.js.d.ts           # Type declarations for sql.js
 │   ├── tools/
-│   │   └── index.ts          # MCP tool registrations + handlers
+│   │   ├── index.ts          # MCP tool registrations + handlers
+│   │   └── server.test.ts    # End-to-end tests (in-memory MCP transport)
+│   ├── resources/
+│   │   └── index.ts          # polvenn://watchlist + polvenn://config resources
+│   ├── prompts/
+│   │   └── index.ts          # MCP prompts
 │   ├── schemas/
-│   │   └── tools.ts          # Zod input schemas
+│   │   ├── tools.ts          # Zod input schemas
+│   │   └── output.ts         # Zod output schemas (structured content contracts)
 │   ├── services/
 │   │   ├── release-feed.ts   # External release feed client
 │   │   ├── vinmonopolet.ts   # Vinmonopolet API client
 │   │   └── watchlist.ts      # Watchlist matching logic
 │   ├── utils/
+│   │   ├── concurrency.ts    # Bounded-concurrency async mapping
 │   │   ├── geo.ts            # Distance calculations
-│   │   └── http.ts           # Fetch retry/backoff
+│   │   └── http.ts           # Fetch retry/backoff + per-attempt timeouts
 │   └── db/
-│       └── database.ts       # SQLite via sql.js — watchlist, cache, config
+│       ├── database.ts       # SQLite via sql.js — watchlist, cache, config, migrations
+│       └── migrations.test.ts
+├── scripts/
+│   └── smoke.mjs             # Stdio MCP handshake smoke test
+├── .github/workflows/ci.yml  # lint + typecheck + test + build + smoke (Node 20/22/24)
 ├── package.json
 ├── tsconfig.json
+├── biome.json
+├── vitest.config.ts
 ├── .gitignore
 ├── README.md
 └── AGENTS.md
@@ -71,15 +84,21 @@ polvenn-mcp-server/
 
 ### 1. Vinmonopolet API
 
-- Base: `https://api.vinmonopolet.no`
+- Base: `https://apis.vinmonopolet.no`
 - Auth: `Ocp-Apim-Subscription-Key`
 - Used endpoints:
   - `GET /products/v0/details-normal`
   - `GET /stores/v0/details`
   - `GET /products/v0/accumulated-stock`
+- Undocumented website endpoints on `https://www.vinmonopolet.no` (no auth):
+  - `GET /vmpws/v2/vmp/products/search` ("Nyheter" / "Kommende nyheter" facets)
+  - `GET /vmpws/v2/vmp/stores/{id}`
+  - `GET /vmpws/v2/vmp/products/{id}/stock` (stock locator fallback)
+  - product pages `/p/{id}` (embedded JSON payload, parsed with cheerio)
 - Notes:
   - stock access may require more than the free `Open` subscription
   - product and store access should work with `Open`
+  - upstream responses are validated leniently (zod loose schemas); malformed entries are dropped with a warning instead of failing the call
 
 ### 2. External release feed
 
@@ -92,27 +111,34 @@ polvenn-mcp-server/
 
 ## Tools
 
-Current tool set:
+Current tool set (every tool declares an `outputSchema`; structured content is validated against it):
 
 | Tool | Description |
 |------|-------------|
 | `polvenn_search_new_beers` | Find new releases from Vinmonopolet and/or the external release feed |
+| `polvenn_search_upcoming_beers` | Find upcoming releases from Vinmonopolet's "Kommende nyheter" listing |
+| `polvenn_search_new_beers_near_store` | Find new releases available in one store |
+| `polvenn_search_products` | Search the full Vinmonopolet catalogue by name or article number |
+| `polvenn_get_product` | Get full details for one article number |
 | `polvenn_check_store_stock` | Check stock for an article number at a store |
 | `polvenn_find_nearby_stores` | Find nearby Vinmonopolet stores by coordinates |
 | `polvenn_watchlist` | Add, remove, list, and check watch rules |
 | `polvenn_configure` | Store API key, home store, and home location |
 | `polvenn_validate_config` | Validate config and probe live capabilities |
 
+### Resources and prompts
+
+- Resources: `polvenn://watchlist` (subscribable, updated on add/remove) and `polvenn://config` (API key masked)
+- Prompts: `polvenn_check_watchlist`, `polvenn_whats_new`, `polvenn_stock_check`
+
 ### Watchlist rules
 
 The watchlist supports:
 
-- `brewery`
-- `style`
-- `series`
-- `keyword`
+- text rules: `brewery`, `style`, `series`, `keyword`, `country`
+- numeric bounds rules: `abv`, `price` (take `minValue`/`maxValue`; `value` is derived)
 
-`check` compares the latest external release against all saved rules and tracks which matches are new since the previous check for that release.
+`check` compares the latest external release against all saved rules and tracks which matches are new since the previous check for that release. Price rules are best-effort: prices are enriched from Vinmonopolet during checks, and beers with unknown prices are reported as not evaluated.
 
 ---
 
@@ -123,9 +149,11 @@ The project builds and tests cleanly.
 Useful validation commands:
 
 ```bash
-npx tsc --noEmit
+npm run typecheck
+npm run lint
 npm run build
 npm test
+npm run smoke
 ```
 
 ---
@@ -142,10 +170,12 @@ npm test
 
 - Dates: ISO 8601 `yyyy-MM-dd`
 - Tool names: `polvenn_` prefix, snake_case
-- Zod schemas: `.strict()`
-- Errors: `{ isError: true, content: [{ type: "text", text: "..." }] }`
+- Zod schemas: `z.strictObject()` for inputs; output schemas in `src/schemas/output.ts`
+- Errors: `{ isError: true, content: [{ type: "text", text: "..." }] }` (no structured content on errors)
 - Logging: `console.error()` only
 - Avoid `any`; prefer `unknown` and type guards
+- Database schema changes go through the `PRAGMA user_version` migration runner in `src/db/database.ts`
+- Tests never touch the real data dir (`src/test/setup.ts` sets a throwaway `POLVENN_DATA_DIR`)
 
 ---
 
@@ -153,7 +183,7 @@ npm test
 
 ```bash
 npm install
-npx tsc --noEmit
+npm run typecheck
 npm run build
 npm start
 ```
@@ -165,7 +195,7 @@ Add to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.polvenn]
 command = "node"
-args = ["/Users/henrik/Repos/mcp-polvenn/dist/index.js"]
+args = ["/Users/henrik/Dev/Repos/mcp-polvenn/dist/index.js"]
 ```
 
 ### First-time configuration

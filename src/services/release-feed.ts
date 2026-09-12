@@ -4,39 +4,47 @@ import { getConfigValue } from "../db/database.js";
 import type { ExternalRelease, ExternalReleaseItem } from "../types.js";
 import { fetchWithRetry } from "../utils/http.js";
 
-const ReleaseItemSchema = z.object({
-  country: z.string().nullable().optional(),
-  articleNumber: z.string().min(1),
-  producer: z.string().min(1),
-  name: z.string().min(1),
-  style: z.string().optional().default(""),
-  abv: z.number().optional().default(0),
-  releaseDate: z.string().optional().default(""),
-}).transform((item): ExternalReleaseItem => ({
-  country: item.country ?? null,
-  articleNumber: item.articleNumber,
-  producer: item.producer,
-  name: item.name,
-  style: item.style,
-  abv: item.abv,
-  releaseDate: item.releaseDate,
-}));
+const ReleaseItemSchema = z
+  .object({
+    country: z.string().nullable().optional(),
+    articleNumber: z.string().min(1),
+    producer: z.string().min(1),
+    name: z.string().min(1),
+    style: z.string().optional().default(""),
+    abv: z.number().optional().default(0),
+    releaseDate: z.string().optional().default(""),
+  })
+  .transform(
+    (item): ExternalReleaseItem => ({
+      country: item.country ?? null,
+      articleNumber: item.articleNumber,
+      producer: item.producer,
+      name: item.name,
+      style: item.style,
+      abv: item.abv,
+      releaseDate: item.releaseDate,
+    }),
+  );
 
-const ReleaseSchema = z.object({
-  id: z.string().min(1),
-  title: z.string().min(1),
-  source: z.string().min(1),
-  publishedAt: z.string().min(1),
-  url: z.string().url().nullable().optional(),
-  items: z.array(ReleaseItemSchema),
-}).transform((release): ExternalRelease => ({
-  id: release.id,
-  title: release.title,
-  source: release.source,
-  publishedAt: release.publishedAt,
-  url: release.url ?? null,
-  items: release.items,
-}));
+const ReleaseSchema = z
+  .object({
+    id: z.string().min(1),
+    title: z.string().min(1),
+    source: z.string().min(1),
+    publishedAt: z.string().min(1),
+    url: z.url().nullable().optional(),
+    items: z.array(ReleaseItemSchema),
+  })
+  .transform(
+    (release): ExternalRelease => ({
+      id: release.id,
+      title: release.title,
+      source: release.source,
+      publishedAt: release.publishedAt,
+      url: release.url ?? null,
+      items: release.items,
+    }),
+  );
 
 const LatestReleasesResponseSchema = z.object({
   releases: z.array(ReleaseSchema),
@@ -51,13 +59,17 @@ function buildReleaseFeedUrl(baseUrl: string, limit: number): string {
 async function getReleaseFeedBaseUrl(): Promise<string> {
   const configuredUrl = await getConfigValue("release_feed_url");
   if (!configuredUrl) {
-    throw new Error("Release feed URL not configured. Use polvenn_configure to set releaseFeedUrl.");
+    throw new Error(
+      "Release feed URL not configured. Use polvenn_configure to set releaseFeedUrl.",
+    );
   }
 
   try {
     return new URL(configuredUrl).toString();
   } catch {
-    throw new Error("Configured release feed URL is invalid. Use polvenn_configure to set a valid absolute URL.");
+    throw new Error(
+      "Configured release feed URL is invalid. Use polvenn_configure to set a valid absolute URL.",
+    );
   }
 }
 
