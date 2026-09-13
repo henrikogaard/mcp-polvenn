@@ -37,7 +37,7 @@ polvenn-mcp-server/
 │   │   ├── index.ts          # MCP tool registrations + handlers
 │   │   └── server.test.ts    # End-to-end tests (in-memory MCP transport)
 │   ├── resources/
-│   │   └── index.ts          # polvenn://watchlist + polvenn://config resources
+│   │   └── index.ts          # resources + polvenn://product and polvenn://store templates
 │   ├── prompts/
 │   │   └── index.ts          # MCP prompts
 │   ├── schemas/
@@ -118,10 +118,13 @@ Current tool set (every tool declares an `outputSchema`; structured content is v
 | `polvenn_search_new_beers` | Find new releases from Vinmonopolet and/or the external release feed |
 | `polvenn_search_upcoming_beers` | Find upcoming releases from Vinmonopolet's "Kommende nyheter" listing |
 | `polvenn_search_new_beers_near_store` | Find new releases available in one store |
-| `polvenn_search_products` | Search the full Vinmonopolet catalogue by name or article number |
-| `polvenn_get_product` | Get full details for one article number |
+| `polvenn_search_products` | Search the full catalogue by name, article number, or EAN-13 barcode (keyless via vinmonopolet.no, with sort support) |
+| `polvenn_get_product` | Get full details for one article number (incl. image URLs) |
 | `polvenn_check_store_stock` | Check stock for an article number at a store |
-| `polvenn_find_nearby_stores` | Find nearby Vinmonopolet stores by coordinates |
+| `polvenn_find_nearby_stores` | Find nearby Vinmonopolet stores by coordinates (incl. today's opening hours) |
+| `polvenn_find_stores_with_stock` | Find stores with a product in stock, ordered by distance (keyless) |
+| `polvenn_get_changed_products` | List products changed since a date via `changedSince` (official API) |
+| `polvenn_get_facets` | List available search filters from vinmonopolet.no (keyless) |
 | `polvenn_watchlist` | Add, remove, list, and check watch rules |
 | `polvenn_configure` | Store API key, home store, and home location |
 | `polvenn_validate_config` | Validate config and probe live capabilities |
@@ -129,6 +132,7 @@ Current tool set (every tool declares an `outputSchema`; structured content is v
 ### Resources and prompts
 
 - Resources: `polvenn://watchlist` (subscribable, updated on add/remove) and `polvenn://config` (API key masked)
+- Resource templates: `polvenn://product/{articleNumber}` and `polvenn://store/{storeId}`
 - Prompts: `polvenn_check_watchlist`, `polvenn_whats_new`, `polvenn_stock_check`
 
 ### Watchlist rules
@@ -137,8 +141,9 @@ The watchlist supports:
 
 - text rules: `brewery`, `style`, `series`, `keyword`, `country`
 - numeric bounds rules: `abv`, `price` (take `minValue`/`maxValue`; `value` is derived)
+- stock rules: `stock` (value = article number; checked against live stock at the home store)
 
-`check` compares the latest external release against all saved rules and tracks which matches are new since the previous check for that release. Price rules are best-effort: prices are enriched from Vinmonopolet during checks, and beers with unknown prices are reported as not evaluated.
+`check` compares the latest external release against all saved rules and tracks which matches are new since the previous check for that release. Price rules are best-effort: prices are enriched from Vinmonopolet during checks, and beers with unknown prices are reported as not evaluated. Stock rules use a separate checkpoint that only remembers currently-in-stock articles, so sell-out-and-return cycles are reported as new again.
 
 ---
 
@@ -154,6 +159,7 @@ npm run lint
 npm run build
 npm test
 npm run smoke
+npm run probe   # opt-in live probe of upstream sources
 ```
 
 ---
@@ -162,7 +168,8 @@ npm run smoke
 
 1. The external release feed must expose the expected JSON shape for MCP lookups to work.
 2. Vinmonopolet stock access may fail for users who only have `Open` subscription access.
-3. Vinmonopolet API response shapes should still be verified against live responses over time.
+3. The official API's details-normal responses have been slimmed down upstream to `basic` + `lastChanged` only (no classification/prices/availability). Polvenn fills the gap from cached/scraped product pages (enrichSlimProducts) and prefers the richer website search; verify with `npm run probe` when the API changes again.
+4. Vinmonopolet removed the "Kommende nyheter" listing from vinmonopolet.no in a site rebuild. `polvenn_search_upcoming_beers` reports this honestly as unavailable; the tool and its plumbing are kept so a future relaunch works again. `polvenn_get_facets` uses the search response's facet tree because the old dedicated facets endpoint is also gone.
 
 ---
 

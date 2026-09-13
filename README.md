@@ -14,18 +14,21 @@ It is designed to run as a local stdio MCP server:
 
 ## What It Does
 
-Polvenn exposes 10 MCP tools, 2 MCP resources, and 3 MCP prompts. Every tool declares its structured output schema, so strict MCP clients get a contractually valid `structuredContent` payload alongside human-readable text.
+Polvenn exposes 13 MCP tools, 2 MCP resources plus 2 resource templates, and 3 MCP prompts. Every tool declares its structured output schema, so strict MCP clients get a contractually valid `structuredContent` payload alongside human-readable text.
 
 | Tool | Description | Writes data? |
 |------|-------------|--------------|
 | `polvenn_search_new_beers` | Search Vinmonopolet's current `Nyheter` listing and/or your external release feed, with optional `Kommende nyheter`, `releaseDate`, and `storeId` filters | No |
 | `polvenn_search_upcoming_beers` | Search Vinmonopolet's "Kommende nyheter" listing for upcoming beer releases | No |
 | `polvenn_search_new_beers_near_store` | Search current `Nyheter` available in one store, using your configured home store or nearest configured location by default | No |
-| `polvenn_search_products` | Search Vinmonopolet's full product catalogue by name or article number (not limited to beer) | No |
-| `polvenn_get_product` | Get full details for one product by article number: price, ABV, volume, availability, tasting notes | No |
+| `polvenn_search_products` | Search the full catalogue by name, article number, or EAN-13 barcode — works without an API key via vinmonopolet.no, with optional name/price sorting | No |
+| `polvenn_get_product` | Get full details for one product by article number: price, ABV, volume, availability, tasting notes, and image URLs | No |
 | `polvenn_check_store_stock` | Check stock for a beer at a Vinmonopolet store, using the official API when possible and Vinmonopolet's web stock locator as fallback | No |
-| `polvenn_find_nearby_stores` | Find the closest Vinmonopolet stores to a coordinate | No |
-| `polvenn_watchlist` | Add, remove, list, and check watch rules | Yes |
+| `polvenn_find_nearby_stores` | Find the closest Vinmonopolet stores to a coordinate, with today's opening hours | No |
+| `polvenn_find_stores_with_stock` | Find stores that currently have a product in stock, ordered by distance (keyless, via the web stock locator) | No |
+| `polvenn_get_changed_products` | List products changed since a date via the official API's `changedSince` filter, with a stored sync marker | Yes (sync marker) |
+| `polvenn_get_facets` | List available search filters (categories, countries, price ranges…) with result counts, from vinmonopolet.no | No |
+| `polvenn_watchlist` | Add, remove, list, and check watch rules — text, ABV/price bounds, and per-article stock watches | Yes |
 | `polvenn_configure` | Store API keys, home store, and home coordinates locally | Yes |
 | `polvenn_validate_config` | Validate current config and probe upstream capabilities | No |
 
@@ -35,6 +38,8 @@ Polvenn exposes 10 MCP tools, 2 MCP resources, and 3 MCP prompts. Every tool dec
 |-----|-------------|
 | `polvenn://watchlist` | Your saved watchlist rules as JSON (subscribable — updated when rules change) |
 | `polvenn://config` | Current configuration as JSON (API key masked) |
+| `polvenn://product/{articleNumber}` | Resource template — one product as JSON, with image URL |
+| `polvenn://store/{storeId}` | Resource template — one store as JSON, with today's opening hours |
 
 ### Prompts
 
@@ -333,7 +338,7 @@ Check my watchlist against the latest release in my external feed.
 
 ## Watchlist Rules
 
-The watchlist supports seven rule types:
+The watchlist supports eight rule types:
 
 | Type | Matches against | Example |
 |------|-----------------|---------|
@@ -344,8 +349,9 @@ The watchlist supports seven rule types:
 | `country` | Country of origin | `Norge` |
 | `abv` | ABV bounds (`minValue`/`maxValue`) | `abv 8–12` |
 | `price` | Price bounds (`minValue`/`maxValue`), best-effort | `price <= 200` |
+| `stock` | One article number's stock at your home store | `20162402` |
 
-Text rules match by substring. `abv` and `price` rules take numeric bounds instead of `value` (which is derived, e.g. `abv >= 10`). Price rules are best-effort: prices are looked up via Vinmonopolet during a check, and beers whose price cannot be resolved are reported as not evaluated rather than silently skipped or guessed.
+Text rules match by substring. `abv` and `price` rules take numeric bounds instead of `value` (which is derived, e.g. `abv >= 10`). Price rules are best-effort: prices are looked up via Vinmonopolet during a check, and beers whose price cannot be resolved are reported as not evaluated rather than silently skipped or guessed. `stock` rules are checked against live store stock at your home store during `check`; a beer that sells out and comes back is reported as new again.
 
 ## Storage
 
@@ -388,6 +394,16 @@ The package metadata is set up for npm publishing:
 - Product lookups fall back to the public product page on `vinmonopolet.no` when the API returns sparse article data
 - Docs: [api.vinmonopolet.no](https://api.vinmonopolet.no)
 
+### Vinmonopolet website (undocumented, no auth)
+
+- Search with free text, facets, and name/price sorting: `www.vinmonopolet.no/vmpws/v2/vmp/products/search`
+- Barcode lookup: `www.vinmonopolet.no/vmpws/v2/vmp/products/barCodeSearch/{ean}`
+- Store stock locator (by proximity, paginated): `www.vinmonopolet.no/vmpws/v2/vmp/products/{id}/stock`
+- Facet tree: `www.vinmonopolet.no/api/search?fields=FULL`
+- Product images (best-effort; placeholder for missing photos): `bilder.vinmonopolet.no/cache/{w}x{h}-0/{article}-1.jpg` — see the [product images post](https://api.vinmonopolet.no/blog/product-images); CDN use is covered by the API terms of service
+
+These endpoints are undocumented and can change without notice; responses are validated leniently and malformed entries are dropped with a warning rather than failing the call.
+
 ### External Release Feed
 
 - Base: your configured `releaseFeedUrl`
@@ -428,6 +444,7 @@ npm run lint        # biome check
 npm test            # vitest run (tests never touch your real ~/.polvenn data)
 npm run build
 npm run smoke       # spawns dist/index.js and verifies the MCP handshake, tools, resources, prompts
+npm run probe       # opt-in live probe of every upstream source; records fixtures/live/ (gitignored)
 ```
 
 CI runs lint, typecheck, tests, build, and the smoke script on Node 20/22/24 via GitHub Actions.
@@ -454,6 +471,8 @@ npx @modelcontextprotocol/inspector node dist/index.js
 
 - The server is intentionally local-first and stdio-first.
 - Stock access may depend on the Vinmonopolet subscription tier you have.
+- The official API's product responses have been slimmed down upstream (basic + lastChanged only); Polvenn enriches them from product pages and prefers the richer website search.
+- Vinmonopolet removed the "Kommende nyheter" listing from vinmonopolet.no; `polvenn_search_upcoming_beers` reports that honestly instead of returning empty results. The other website endpoints used here (search, barcode, stock locator, facet tree via search) were verified live in September 2026.
 - ChatGPT support requires a remote MCP variant of this server.
 
 ## License

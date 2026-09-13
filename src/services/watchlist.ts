@@ -42,6 +42,11 @@ function getMatchedRules(
         return beer.abv > 0 && matchesNumericBounds(beer.abv, entry);
       case "price":
         return matchesNumericBounds(beerPrice, entry);
+      case "stock":
+        // Stock rules watch a single article at the home store; they are
+        // evaluated against live stock in the watchlist check, never against
+        // release feed items.
+        return false;
       default:
         return false;
     }

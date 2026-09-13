@@ -129,6 +129,29 @@ const MIGRATIONS: Migration[] = [
       db.run("ALTER TABLE watchlist_new RENAME TO watchlist");
     },
   },
+  {
+    // v3: watchlist gains the 'stock' rule type (watch one article's stock).
+    version: 3,
+    up: (db) => {
+      db.run(`
+        CREATE TABLE watchlist_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT NOT NULL CHECK(type IN ('brewery', 'style', 'series', 'keyword', 'country', 'abv', 'price', 'stock')),
+          value TEXT NOT NULL,
+          min_value REAL,
+          max_value REAL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(type, value)
+        )
+      `);
+      db.run(`
+        INSERT INTO watchlist_new (id, type, value, min_value, max_value, created_at)
+        SELECT id, type, value, min_value, max_value, created_at FROM watchlist
+      `);
+      db.run("DROP TABLE watchlist");
+      db.run("ALTER TABLE watchlist_new RENAME TO watchlist");
+    },
+  },
 ];
 
 function runMigrations(db: SqlJsDatabase): void {

@@ -2,7 +2,11 @@ import * as cheerio from "cheerio";
 import { z } from "zod";
 import {
   FETCH_CONCURRENCY,
+  MAX_FACET_VALUES,
   MAX_LIMIT,
+  MAX_STOCK_LOCATOR_PAGES,
+  MAX_WEBSITE_SEARCH_PAGES,
+  STOCK_LOCATOR_PAGE_SIZE,
   STORES_CACHE_TTL_MS,
   USER_AGENT,
   VINMONOPOLET_API_BASE,
@@ -13,6 +17,7 @@ import {
   VINMONOPOLET_WEB_PRODUCT_STOCK_PATH,
   VINMONOPOLET_WEB_SEARCH_PATH,
   VINMONOPOLET_WEB_STORES_PATH,
+  WEBSITE_SEARCH_PAGE_SIZE,
 } from "../constants.js";
 import { getCachedBeer, getConfigValue, setCachedBeer } from "../db/database.js";
 import type {
@@ -22,6 +27,7 @@ import type {
   VinmonopoletStore,
 } from "../types.js";
 import { mapWithConcurrency } from "../utils/concurrency.js";
+import { warn } from "../utils/diagnostics.js";
 import { haversineDistanceKm } from "../utils/geo.js";
 import { fetchWithRetry } from "../utils/http.js";
 
@@ -44,8 +50,15 @@ const ApiStockRowSchema = z.looseObject({
   stock: z.number(),
 });
 
+const WebsitePaginationSchema = z.looseObject({
+  totalPages: z.number().optional(),
+  totalResults: z.number().optional(),
+});
+
 const WebsiteSearchResponseSchema = z.looseObject({
   products: z.array(z.unknown()).optional(),
+  facets: z.array(z.unknown()).optional(),
+  pagination: WebsitePaginationSchema.optional(),
 });
 
 const WebsiteStoreSchema = z.looseObject({
@@ -59,6 +72,12 @@ const WebsiteStoreSchema = z.looseObject({
 
 const WebsiteStockLocatorResponseSchema = z.looseObject({
   stores: z.array(z.unknown()).optional(),
+  pagination: WebsitePaginationSchema.optional(),
+});
+
+const WebsiteBarcodeResponseSchema = z.looseObject({
+  code: z.string().optional(),
+  name: z.string().optional(),
 });
 
 function parseValidEntries<T>(label: string, schema: z.ZodType<T>, rows: unknown[]): T[] {
@@ -68,9 +87,7 @@ function parseValidEntries<T>(label: string, schema: z.ZodType<T>, rows: unknown
     if (result.success) {
       valid.push(result.data);
     } else {
-      console.error(
-        `polvenn: dropping malformed ${label} at index ${index}: ${result.error.message}`,
-      );
+      warn(`dropping malformed ${label} at index ${index}: ${result.error.message}`);
     }
   });
   return valid;
@@ -139,6 +156,12 @@ interface VinmonopoletWebsiteSearchProduct {
   alcohol?: {
     value?: number;
   };
+  price?: {
+    value?: number;
+  };
+  volume?: {
+    value?: number;
+  };
   main_category?: {
     name?: string;
   };
@@ -205,6 +228,38 @@ async function apiRequest(path: string, params: Record<string, string> = {}): Pr
   return response.json();
 }
 
+// Minimal cookie jar for website requests: the site may set cookies that
+// later requests are expected to present, and cookie-less clients risk being
+// treated differently. Best-effort — never blocks a request.
+const websiteCookies = new Map<string, string>();
+
+function cookieHeader(): Record<string, string> {
+  if (websiteCookies.size === 0) {
+    return {};
+  }
+  const cookie = Array.from(websiteCookies.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+  return { Cookie: cookie };
+}
+
+function rememberCookies(response: Response): void {
+  const setCookie =
+    typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie() : [];
+  for (const raw of setCookie) {
+    const [pair] = raw.split(";");
+    const separator = pair.indexOf("=");
+    if (separator > 0) {
+      websiteCookies.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+    }
+  }
+}
+
+/** Test hook: forget remembered website cookies. */
+export function resetWebsiteCookiesForTests(): void {
+  websiteCookies.clear();
+}
+
 async function websiteRequest(path: string, params: Record<string, string> = {}): Promise<unknown> {
   const url = new URL(path, VINMONOPOLET_WEB_BASE);
   for (const [key, value] of Object.entries(params)) {
@@ -215,8 +270,11 @@ async function websiteRequest(path: string, params: Record<string, string> = {})
     headers: {
       "User-Agent": USER_AGENT,
       Accept: "application/json",
+      ...cookieHeader(),
     },
   });
+
+  rememberCookies(response);
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -225,7 +283,21 @@ async function websiteRequest(path: string, params: Record<string, string> = {})
     );
   }
 
-  return response.json();
+  const payload: unknown = await response.json();
+
+  // The website API signals failures inside an otherwise-200 body.
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    Array.isArray((payload as { errors?: unknown }).errors) &&
+    ((payload as { errors: unknown[] }).errors.length ?? 0) > 0
+  ) {
+    throw new Error(
+      `Vinmonopolet website error in response body: ${JSON.stringify((payload as { errors: unknown[] }).errors)}`,
+    );
+  }
+
+  return payload;
 }
 
 async function websiteSearchRequest(params: Record<string, string>): Promise<unknown> {
@@ -408,7 +480,7 @@ function mapWebsiteSearchProductToVinmonopoletProduct(
       productShortName,
       productLongName: productShortName,
       alcoholContent: product.alcohol?.value ?? null,
-      volume: null,
+      volume: product.volume?.value ?? null,
       vintage: null,
       ageLimit: null,
       packagingMaterialId: null,
@@ -443,6 +515,14 @@ function mapWebsiteSearchProductToVinmonopoletProduct(
         producerName: product.main_producer?.name ?? null,
       },
     },
+    prices:
+      product.price?.value != null
+        ? {
+            salesPrice: product.price.value,
+            salesPricePrLiter: null,
+            bottleReturnValue: null,
+          }
+        : undefined,
     availability: {
       buyable: product.buyable,
       productSelection: product.product_selection ?? null,
@@ -543,47 +623,244 @@ export async function getProducts(
   return parseValidEntries("product", ApiProductSchema, rows) as unknown as VinmonopoletProduct[];
 }
 
-async function getWebsiteBeerListings(
-  query: string,
-  maxResults = 25,
+/**
+ * The official API's details-normal responses have been slimmed down to
+ * `basic` + `lastChanged` only. This fills in the missing detail (style,
+ * category, prices, …) from cached or scraped product pages, leaving already
+ * complete products untouched. Best-effort per product.
+ */
+export async function enrichSlimProducts(
+  products: VinmonopoletProduct[],
 ): Promise<VinmonopoletProduct[]> {
+  return mapWithConcurrency(products, FETCH_CONCURRENCY, async (product) => {
+    if (product.classification?.mainProductTypeName) {
+      return product;
+    }
+
+    const productId = product.basic.productId;
+
+    const cached = await getCachedBeer(productId);
+    if (cached) {
+      const parsed = JSON.parse(cached) as VinmonopoletProduct;
+      if (parsed.classification?.mainProductTypeName) {
+        return mergeProductData(parsed, product);
+      }
+    }
+
+    try {
+      const pageProduct = await getProductFromProductPage(productId);
+      const merged = mergeProductData(pageProduct, product);
+      await setCachedBeer(productId, JSON.stringify(merged), "vinmonopolet");
+      return merged;
+    } catch {
+      return product;
+    }
+  });
+}
+
+/** One page of the website product search. */
+async function getWebsiteSearchPage(
+  query: string,
+  page: number,
+  pageSize: number,
+): Promise<{ payload: z.infer<typeof WebsiteSearchResponseSchema> }> {
   const payload = parseEnvelope(
     WebsiteSearchResponseSchema,
     await websiteSearchRequest({
       q: query,
       fields: "FULL",
-      pageSize: String(maxResults),
-      currentPage: "0",
+      pageSize: String(pageSize),
+      currentPage: String(page),
     }),
     "vinmonopolet.no search",
   );
+  return { payload };
+}
 
-  const candidates = (payload.products ?? []) as VinmonopoletWebsiteSearchProduct[];
+async function getWebsiteBeerListings(
+  query: string,
+  maxResults = 25,
+): Promise<VinmonopoletProduct[]> {
+  const candidates: VinmonopoletWebsiteSearchProduct[] = [];
+  let page = 0;
+  let totalPages = 1;
+
+  // Follow pagination (capped) until we have enough candidates to fill the
+  // requested result size after beer-filtering.
+  do {
+    const { payload } = await getWebsiteSearchPage(query, page, WEBSITE_SEARCH_PAGE_SIZE);
+    candidates.push(...((payload.products ?? []) as VinmonopoletWebsiteSearchProduct[]));
+    totalPages = Math.max(1, Math.floor(payload.pagination?.totalPages ?? page + 1));
+    page += 1;
+  } while (
+    page < totalPages &&
+    page < MAX_WEBSITE_SEARCH_PAGES &&
+    candidates.filter((candidate) => candidate.code).length < maxResults
+  );
+
+  const limitedCandidates = candidates.slice(0, maxResults);
 
   // Each candidate needs its own detail lookup; run them with bounded
   // concurrency instead of one-at-a-time so a 100-item listing doesn't
   // turn into 100 sequential requests.
-  const products = await mapWithConcurrency(candidates, FETCH_CONCURRENCY, async (candidate) => {
-    const productId = candidate.code?.trim();
-    if (!productId) {
-      return null;
-    }
+  const products = await mapWithConcurrency(
+    limitedCandidates,
+    FETCH_CONCURRENCY,
+    async (candidate) => {
+      const productId = candidate.code?.trim();
+      if (!productId) {
+        return null;
+      }
 
-    const mapped = mapWebsiteSearchProductToVinmonopoletProduct(candidate);
-    const detailed = await getProductById(productId);
-    if (detailed) {
-      return mapped ? mergeProductData(detailed, mapped) : detailed;
-    }
-    return mapped;
-  });
+      const mapped = mapWebsiteSearchProductToVinmonopoletProduct(candidate);
+      const detailed = await getProductById(productId);
+      if (detailed) {
+        return mapped ? mergeProductData(detailed, mapped) : detailed;
+      }
+      return mapped;
+    },
+  );
 
   return products
     .filter((product): product is VinmonopoletProduct => product != null)
     .filter(isBeer);
 }
 
+export type WebsiteProductSort =
+  | "relevance"
+  | "name_asc"
+  | "name_desc"
+  | "price_asc"
+  | "price_desc";
+
+/**
+ * Free-text product search against vinmonopolet.no. Needs no API key, covers
+ * the whole assortment (including bestillingsutvalget), and supports sorting
+ * by name or price.
+ */
+export async function searchWebsiteProducts(
+  query: string,
+  options: { maxResults?: number; sort?: WebsiteProductSort } = {},
+): Promise<VinmonopoletProduct[]> {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return [];
+  }
+
+  const maxResults = Math.min(Math.max(options.maxResults ?? 25, 1), MAX_LIMIT);
+  // The website wire format joins sort field and order with a hyphen
+  // (e.g. "price-asc"), while our public enum uses underscores.
+  const sortParam = (options.sort ?? "relevance").replace(/_(asc|desc)$/, "-$1");
+  const searchQuery = `${trimmedQuery}:${sortParam}`;
+
+  const { payload } = await getWebsiteSearchPage(searchQuery, 0, maxResults);
+  const candidates = (payload.products ?? []) as VinmonopoletWebsiteSearchProduct[];
+
+  return candidates
+    .map((candidate) => mapWebsiteSearchProductToVinmonopoletProduct(candidate))
+    .filter((product): product is VinmonopoletProduct => product != null)
+    .slice(0, maxResults);
+}
+
+/** Look up a product by EAN-13 barcode via the vinmonopolet.no website API. */
+export async function getProductByBarcode(barcode: string): Promise<VinmonopoletProduct | null> {
+  const payload = parseEnvelope(
+    WebsiteBarcodeResponseSchema,
+    await websiteRequest(`/vmpws/v2/vmp/products/barCodeSearch/${encodeURIComponent(barcode)}`, {
+      fields: "FULL",
+    }),
+    "vinmonopolet.no barcode search",
+  );
+
+  return mapWebsiteSearchProductToVinmonopoletProduct(payload as VinmonopoletWebsiteSearchProduct);
+}
+
+export interface SearchFacetValue {
+  name: string;
+  count: number | null;
+}
+
+export interface SearchFacet {
+  name: string;
+  displayName: string | null;
+  values: SearchFacetValue[];
+}
+
+/**
+ * Fetch the facet tree (available filters). The old dedicated facets endpoint
+ * died in a site rebuild; the search response itself carries the facets now.
+ */
+export async function getSearchFacets(): Promise<SearchFacet[]> {
+  const { payload } = await getWebsiteSearchPage(":relevance", 0, 1);
+
+  const facets = (payload.facets ?? []) as Array<{
+    code?: unknown;
+    name?: unknown;
+    values?: unknown;
+  }>;
+
+  const result: SearchFacet[] = [];
+  for (const facet of facets) {
+    if (typeof facet.code !== "string") {
+      continue;
+    }
+
+    const rawValues = Array.isArray(facet.values) ? facet.values : [];
+    const values: SearchFacetValue[] = [];
+    for (const rawValue of rawValues.slice(0, MAX_FACET_VALUES)) {
+      if (
+        typeof rawValue === "object" &&
+        rawValue !== null &&
+        typeof (rawValue as { name?: unknown }).name === "string"
+      ) {
+        const count = (rawValue as { count?: unknown }).count;
+        values.push({
+          name: (rawValue as { name: string }).name,
+          count: typeof count === "number" ? count : null,
+        });
+      }
+    }
+
+    result.push({
+      name: facet.code,
+      displayName: typeof facet.name === "string" ? facet.name : null,
+      values,
+    });
+  }
+
+  return result;
+}
+
+const UPCOMING_BEERS_QUERY = ":relevance:upcomingProduct:true:mainCategory:øl";
+
 export async function getUpcomingBeers(maxResults = 25): Promise<VinmonopoletProduct[]> {
-  return getWebsiteBeerListings(":relevance:upcomingProduct:true:mainCategory:øl", maxResults);
+  // A vinmonopolet.no site rebuild removed the "Kommende nyheter" listing:
+  // the query still succeeds but matches nothing, which would silently look
+  // like "no upcoming beers". Detect the removed facet and say so instead.
+  const probe = parseEnvelope(
+    WebsiteSearchResponseSchema,
+    await websiteSearchRequest({
+      q: UPCOMING_BEERS_QUERY,
+      fields: "FULL",
+      pageSize: "1",
+      currentPage: "0",
+    }),
+    "vinmonopolet.no search",
+  );
+
+  const facetCodes = new Set(
+    ((probe.facets ?? []) as Array<{ code?: unknown }>)
+      .map((facet) => (typeof facet.code === "string" ? facet.code : ""))
+      .filter(Boolean),
+  );
+
+  if (!facetCodes.has("upcomingProduct")) {
+    throw new Error(
+      "Vinmonopolet's 'Kommende nyheter' listing is no longer available: the upcomingProduct facet was removed from vinmonopolet.no in a site rebuild, and no replacement has been found yet.",
+    );
+  }
+
+  return getWebsiteBeerListings(UPCOMING_BEERS_QUERY, maxResults);
 }
 
 export async function getNewBeers(maxResults = MAX_LIMIT): Promise<VinmonopoletProduct[]> {
@@ -735,6 +1012,90 @@ async function getWebsiteStoreById(storeId: string) {
   return payload;
 }
 
+interface StockLocatorEntry {
+  storeId: string;
+  storeName: string | null;
+  stockLevel: number;
+}
+
+async function getStockLocatorPage(
+  productId: string,
+  latitude: number,
+  longitude: number,
+  page: number,
+): Promise<{ entries: StockLocatorEntry[]; totalPages: number }> {
+  const payload = parseEnvelope(
+    WebsiteStockLocatorResponseSchema,
+    await websiteRequest(
+      `${VINMONOPOLET_WEB_PRODUCT_STOCK_PATH}/${encodeURIComponent(productId)}/stock`,
+      {
+        pageSize: String(STOCK_LOCATOR_PAGE_SIZE),
+        currentPage: String(page),
+        fields: "BASIC",
+        latitude: latitude.toString(),
+        longitude: longitude.toString(),
+      },
+    ),
+    "vinmonopolet.no stock locator",
+  );
+
+  const rawEntries = (payload.stores ?? []) as NonNullable<
+    VinmonopoletWebsiteStockLocatorResponse["stores"]
+  >;
+
+  const entries = rawEntries
+    .map((entry): StockLocatorEntry | null => {
+      const pointOfService = entry.pointOfService;
+      const matchedStoreId = pointOfService?.id ?? pointOfService?.name;
+      const stockLevel = entry.stockInfo?.stockLevel;
+      if (!matchedStoreId || stockLevel == null) {
+        return null;
+      }
+      return {
+        storeId: matchedStoreId,
+        storeName: pointOfService?.displayName ?? pointOfService?.name ?? null,
+        stockLevel,
+      };
+    })
+    .filter((entry): entry is StockLocatorEntry => entry != null);
+
+  const totalPages = Math.max(1, Math.floor(payload.pagination?.totalPages ?? page + 1));
+  return { entries, totalPages };
+}
+
+/**
+ * Pages through the vinmonopolet.no stock locator (stores listed by
+ * proximity) collecting stock entries, until `shouldContinue` says stop.
+ */
+async function collectStockLocatorEntries(
+  productId: string,
+  latitude: number,
+  longitude: number,
+  shouldContinue: (collected: StockLocatorEntry[], page: number, totalPages: number) => boolean,
+): Promise<StockLocatorEntry[]> {
+  const collected: StockLocatorEntry[] = [];
+  let page = 0;
+  let totalPages = 1;
+
+  do {
+    const { entries, totalPages: pages } = await getStockLocatorPage(
+      productId,
+      latitude,
+      longitude,
+      page,
+    );
+    totalPages = pages;
+    collected.push(...entries);
+    page += 1;
+  } while (
+    page < totalPages &&
+    page < MAX_STOCK_LOCATOR_PAGES &&
+    shouldContinue(collected, page, totalPages)
+  );
+
+  return collected;
+}
+
 async function getWebsiteStockRows(
   productId: string,
   storeId: string,
@@ -747,42 +1108,53 @@ async function getWebsiteStockRows(
     throw new Error(`Vinmonopolet website store ${storeId} did not include coordinates.`);
   }
 
-  const payload = parseEnvelope(
-    WebsiteStockLocatorResponseSchema,
-    await websiteRequest(
-      `${VINMONOPOLET_WEB_PRODUCT_STOCK_PATH}/${encodeURIComponent(productId)}/stock`,
-      {
-        pageSize: "10",
-        currentPage: "0",
-        fields: "BASIC",
-        latitude: latitude.toString(),
-        longitude: longitude.toString(),
-      },
-    ),
-    "vinmonopolet.no stock locator",
+  // The locator lists stores by proximity; keep paging until the target
+  // store appears so a stocked store outside the first page is not missed.
+  const entries = await collectStockLocatorEntries(
+    productId,
+    latitude,
+    longitude,
+    (collected) => !collected.some((entry) => entry.storeId === storeId),
   );
 
-  const rows = (
-    (payload.stores ?? []) as NonNullable<VinmonopoletWebsiteStockLocatorResponse["stores"]>
-  )
-    .map((entry): VinmonopoletStockRow | null => {
-      const pointOfService = entry.pointOfService;
-      const matchedStoreId = pointOfService?.id ?? pointOfService?.name;
-      const stockLevel = entry.stockInfo?.stockLevel;
+  return entries.map((entry) => ({
+    productId,
+    storeId: entry.storeId,
+    stock: entry.stockLevel,
+  }));
+}
 
-      if (!matchedStoreId || stockLevel == null) {
-        return null;
-      }
+export interface WebsiteStoreStock {
+  storeId: string;
+  storeName: string;
+  stockLevel: number;
+}
 
-      return {
-        productId,
-        storeId: matchedStoreId,
-        stock: stockLevel,
-      };
-    })
-    .filter((row): row is VinmonopoletStockRow => row != null);
+/**
+ * Finds stores that currently have a product in stock, ordered by distance
+ * from the given coordinates (the stock locator's native ordering).
+ */
+export async function findStoresWithProductStock(
+  productId: string,
+  latitude: number,
+  longitude: number,
+  maxStores = 20,
+): Promise<WebsiteStoreStock[]> {
+  const entries = await collectStockLocatorEntries(
+    productId,
+    latitude,
+    longitude,
+    (collected) => collected.filter((entry) => entry.stockLevel > 0).length < maxStores,
+  );
 
-  return rows;
+  return entries
+    .filter((entry) => entry.stockLevel > 0)
+    .slice(0, maxStores)
+    .map((entry) => ({
+      storeId: entry.storeId,
+      storeName: entry.storeName ?? entry.storeId,
+      stockLevel: entry.stockLevel,
+    }));
 }
 
 export async function checkStoreStock(
@@ -879,4 +1251,33 @@ export async function findNearbyStores(
 export async function getStoreById(storeId: string): Promise<VinmonopoletStore | null> {
   const stores = await getStores();
   return stores.find((store) => store.storeId === storeId) ?? null;
+}
+
+export interface OpeningHoursToday {
+  dayOfTheWeek: string;
+  openingTime: string;
+  closingTime: string;
+  closed: boolean;
+}
+
+// The store API may use Norwegian or English day names; match either.
+const WEEKDAY_NAMES: string[][] = [
+  ["søndag", "sunday"], // 0
+  ["mandag", "monday"], // 1
+  ["tirsdag", "tuesday"], // 2
+  ["onsdag", "wednesday"], // 3
+  ["torsdag", "thursday"], // 4
+  ["fredag", "friday"], // 5
+  ["lørdag", "saturday"], // 6
+];
+
+export function getTodaysOpeningHours(
+  store: VinmonopoletStore,
+  date: Date = new Date(),
+): OpeningHoursToday | null {
+  const candidates = WEEKDAY_NAMES[date.getDay()] ?? [];
+  const hours = store.openingHours?.regularHours ?? [];
+  return (
+    hours.find((entry) => candidates.includes(entry.dayOfTheWeek?.toLowerCase() ?? "")) ?? null
+  );
 }

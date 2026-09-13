@@ -34,3 +34,6 @@ coverage/
 
 # Local agent session artifacts
 .zcode/
+
+# Live probe fixtures (local reference data)
+fixtures/

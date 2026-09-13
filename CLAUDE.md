@@ -52,15 +52,18 @@ src/
 - `polvenn_search_new_beers`
 - `polvenn_search_upcoming_beers`
 - `polvenn_search_new_beers_near_store`
-- `polvenn_search_products`
+- `polvenn_search_products` (name / article number / EAN-13 barcode; keyless website fallback)
 - `polvenn_get_product`
 - `polvenn_check_store_stock`
 - `polvenn_find_nearby_stores`
+- `polvenn_find_stores_with_stock`
+- `polvenn_get_changed_products`
+- `polvenn_get_facets`
 - `polvenn_watchlist`
 - `polvenn_configure`
 - `polvenn_validate_config`
 
-Also exposes resources `polvenn://watchlist` and `polvenn://config`, plus three prompts (`polvenn_check_watchlist`, `polvenn_whats_new`, `polvenn_stock_check`).
+Also exposes resources `polvenn://watchlist` and `polvenn://config`, resource templates `polvenn://product/{articleNumber}` and `polvenn://store/{storeId}`, plus three prompts (`polvenn_check_watchlist`, `polvenn_whats_new`, `polvenn_stock_check`).
 
 ## Important notes
 
@@ -71,7 +74,8 @@ Also exposes resources `polvenn://watchlist` and `polvenn://config`, plus three 
 - external release data comes from your configured `releaseFeedUrl`
 - stock access may be limited if the user only has Vinmonopolet `Open` access
 - HTTP requests have retry with backoff and a 15s per-attempt timeout
-- watchlist rules: `brewery`, `style`, `series`, `keyword`, `country` (text) and `abv`, `price` (numeric bounds; price is best-effort via Vinmonopolet)
+- watchlist rules: `brewery`, `style`, `series`, `keyword`, `country` (text); `abv`, `price` (numeric bounds; price is best-effort via Vinmonopolet); `stock` (article number, checked at the home store)
+- product images come from `bilder.vinmonopolet.no` (no auth; placeholder when missing)
 
 ## Useful commands
 
@@ -81,6 +85,7 @@ npm run lint
 npm test
 npm run build
 npm run smoke
+npm run probe
 npx @modelcontextprotocol/inspector node dist/index.js
 ```
 

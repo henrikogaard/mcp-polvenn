@@ -88,6 +88,6 @@ describe("schema migrations", () => {
   it("stamps a fresh database at the latest version", async () => {
     const db = await getDb();
     const version = db.exec("PRAGMA user_version")[0].values[0][0];
-    expect(Number(version)).toBe(2);
+    expect(Number(version)).toBe(3);
   });
 });

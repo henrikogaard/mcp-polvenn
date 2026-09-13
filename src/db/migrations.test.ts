@@ -37,7 +37,7 @@ async function writeLegacyDatabase(): Promise<void> {
 }
 
 describe("legacy database migration", () => {
-  it("upgrades a v1 database to v2, preserving rows and accepting new rule types", async () => {
+  it("upgrades a v1 database to the latest version, preserving rows and accepting new rule types", async () => {
     await writeLegacyDatabase();
 
     const { getDb, listWatchlistEntries, getConfigValue, addWatchlistEntry } = await import(
@@ -46,7 +46,7 @@ describe("legacy database migration", () => {
 
     const db = await getDb();
     const version = Number(db.exec("PRAGMA user_version")[0].values[0][0]);
-    expect(version).toBe(2);
+    expect(version).toBe(3);
 
     // Existing rows survived the table rebuild.
     const entries = await listWatchlistEntries();
@@ -61,7 +61,10 @@ describe("legacy database migration", () => {
     expect(added.minValue).toBeNull();
     expect(added.maxValue).toBe(200);
 
+    // ...including the v3 'stock' rule type.
+    await addWatchlistEntry("stock", "20162402");
+
     const after = await listWatchlistEntries();
-    expect(after).toHaveLength(3);
+    expect(after).toHaveLength(4);
   });
 });

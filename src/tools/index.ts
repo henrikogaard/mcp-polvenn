@@ -15,6 +15,9 @@ import {
   CheckStoreStockOutputSchema,
   ConfigureOutputSchema,
   FindNearbyStoresOutputSchema,
+  FindStoresWithStockOutputSchema,
+  GetChangedProductsOutputSchema,
+  GetFacetsOutputSchema,
   GetProductOutputSchema,
   SearchNewBeersNearStoreOutputSchema,
   SearchNewBeersOutputSchema,
@@ -27,6 +30,9 @@ import {
   CheckStoreStockSchema,
   ConfigureSchema,
   FindNearbyStoresSchema,
+  FindStoresWithStockSchema,
+  GetChangedProductsSchema,
+  GetFacetsSchema,
   GetProductSchema,
   NewBeersNearStoreSchema,
   SearchNewBeersSchema,
@@ -49,6 +55,7 @@ import type {
   WatchlistEntry,
   WatchlistMatch,
 } from "../types.js";
+import { buildProductImageUrl } from "../utils/images.js";
 
 export function registerAllTools(server: McpServer): void {
   registerSearchNewBeers(server);
@@ -58,6 +65,9 @@ export function registerAllTools(server: McpServer): void {
   registerGetProduct(server);
   registerCheckStoreStock(server);
   registerFindNearbyStores(server);
+  registerFindStoresWithStock(server);
+  registerGetChangedProducts(server);
+  registerGetFacets(server);
   registerWatchlist(server);
   registerConfigure(server);
   registerValidateConfig(server);
@@ -435,6 +445,7 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
           new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
         const resolvedStore = params.storeId ? await resolveStoreContext(params.storeId) : null;
         const includeUpcoming = params.includeUpcoming && resolvedStore == null;
+        let upcomingUnavailable = false;
 
         const resultMap = new Map<string, BeerSearchResult>();
 
@@ -454,13 +465,20 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
           }
 
           if (includeUpcoming) {
-            const upcomingBeers = await vinmonopolet.getUpcomingBeers(params.limit);
-            for (const beer of upcomingBeers) {
-              const next = mergeBeerSearchResults(
-                resultMap.get(beer.basic.productId),
-                mapVinmonopoletBeerToSearchResult(beer, "vinmonopolet_upcoming"),
-              );
-              resultMap.set(beer.basic.productId, next);
+            try {
+              const upcomingBeers = await vinmonopolet.getUpcomingBeers(params.limit);
+              for (const beer of upcomingBeers) {
+                const next = mergeBeerSearchResults(
+                  resultMap.get(beer.basic.productId),
+                  mapVinmonopoletBeerToSearchResult(beer, "vinmonopolet_upcoming"),
+                );
+                resultMap.set(beer.basic.productId, next);
+              }
+            } catch (error: unknown) {
+              // The upcoming listing may be unavailable upstream; degrade to a
+              // note instead of failing the whole search.
+              upcomingUnavailable = true;
+              console.error(`polvenn: upcoming listing unavailable: ${(error as Error).message}`);
             }
           }
         }
@@ -509,6 +527,9 @@ Returns: List of new beers with name, producer, style, ABV, article number, and 
             : null,
           params.includeUpcoming && resolvedStore
             ? "Upcoming beers were skipped because Vinmonopolet's upcoming listing is not store-specific."
+            : null,
+          upcomingUnavailable
+            ? "Upcoming beers were skipped because Vinmonopolet's 'Kommende nyheter' listing is currently unavailable on vinmonopolet.no."
             : null,
         ].filter((part): part is string => part != null);
         const body =
@@ -847,11 +868,30 @@ Returns: List of nearby stores with address, distance, category, and opening hou
 
         const maxResults = params.maxResults ?? 5;
         const stores = await vinmonopolet.findNearbyStores(lat, lon, maxResults);
-        const text = stores
-          .map(
-            (store, index) =>
-              `${index + 1}. **${store.storeName}** (${store.distanceKm.toFixed(1)} km)\n   ${store.address.street}, ${store.address.postalCode} ${store.address.city}\n   Category: ${store.category} | ID: ${store.storeId}`,
-          )
+        const storesWithToday = stores.map((store) => ({
+          ...store,
+          todayOpeningHours: vinmonopolet.getTodaysOpeningHours(store),
+        }));
+        const text = storesWithToday
+          .map((store, index) => {
+            const today = store.todayOpeningHours;
+            const todayText = today
+              ? today.closed
+                ? "Closed today"
+                : `Open today ${today.openingTime}–${today.closingTime}`
+              : null;
+            const address = store.address
+              ? `${store.address.street ?? ""}, ${store.address.postalCode ?? ""} ${store.address.city ?? ""}`.trim()
+              : null;
+            return [
+              `${index + 1}. **${store.storeName}** (${store.distanceKm.toFixed(1)} km)`,
+              address && address.length > 0 ? `   ${address}` : null,
+              `   Category: ${store.category} | ID: ${store.storeId}`,
+              todayText ? `   ${todayText}` : null,
+            ]
+              .filter((part): part is string => part != null)
+              .join("\n");
+          })
           .join("\n\n");
 
         return createToolResult(
@@ -860,7 +900,7 @@ Returns: List of nearby stores with address, distance, category, and opening hou
             latitude: lat,
             longitude: lon,
             maxResults,
-            stores,
+            stores: storesWithToday,
           },
           text,
         );
@@ -883,6 +923,7 @@ interface ProductSummary {
   country: string | null;
   status: string | null;
   productPageUrl: string | null;
+  imageUrl: string | null;
 }
 
 function toProductSummary(product: VinmonopoletProduct): ProductSummary {
@@ -898,6 +939,7 @@ function toProductSummary(product: VinmonopoletProduct): ProductSummary {
     country: vinmonopolet.getProductCountry(product),
     status: product.availability?.status ?? product.basic.productStatusSaleName ?? null,
     productPageUrl: product.availability?.productPageUrl ?? null,
+    imageUrl: buildProductImageUrl(product.basic.productId),
   };
 }
 
@@ -922,14 +964,17 @@ function registerSearchProducts(server: McpServer): void {
     "polvenn_search_products",
     {
       title: "Search Vinmonopolet products",
-      description: `Search Vinmonopolet's full product catalogue by name or article number (not limited to beer).
+      description: `Search Vinmonopolet's full product catalogue by name, article number, or EAN-13 barcode (not limited to beer).
+
+Searches vinmonopolet.no directly, so no API key is needed; results include prices, styles, and image URLs. The official API is used as a fallback when the website search fails.
 
 Args:
-  - query (string): Product name, partial name, or exact article number
+  - query (string): Product name, partial name, exact article number, or EAN-13 barcode
   - beerOnly (boolean): Only return beers (default: false)
+  - sort ('relevance' | 'name_asc' | 'name_desc' | 'price_asc' | 'price_desc'): Result ordering
   - limit (number): Max results (default: 25)
 
-Returns: Matching products with producer, style, ABV, volume, price, and country.`,
+Returns: Matching products with producer, style, ABV, volume, price, country, and image URL.`,
       inputSchema: SearchProductsSchema,
       outputSchema: SearchProductsOutputSchema,
       annotations: {
@@ -941,7 +986,40 @@ Returns: Matching products with producer, style, ABV, volume, price, and country
     },
     async (params) => {
       try {
-        const products = await vinmonopolet.searchProducts(params.query, MAX_LIMIT);
+        const trimmedQuery = params.query.trim();
+        const apiKey = await getConfigValue("vinmonopolet_api_key");
+        let products: VinmonopoletProduct[] = [];
+        let source: "official_api" | "website" | "product_lookup" = "website";
+
+        if (/^\d{13}$/.test(trimmedQuery)) {
+          // EAN-13 barcode: website-only capability.
+          const product = await vinmonopolet.getProductByBarcode(trimmedQuery);
+          products = product ? [product] : [];
+          source = "product_lookup";
+        } else if (/^\d+$/.test(trimmedQuery)) {
+          const product = await vinmonopolet.getProductById(trimmedQuery);
+          products = product ? [product] : [];
+          source = "product_lookup";
+        } else {
+          // Website search is the primary path: it needs no key and returns
+          // richer data than the official API, whose product responses have
+          // been slimmed down to basic + lastChanged. The official API is the
+          // fallback when the website search fails.
+          try {
+            products = await vinmonopolet.searchWebsiteProducts(trimmedQuery, {
+              maxResults: MAX_LIMIT,
+              sort: params.sort,
+            });
+            source = "website";
+          } catch (error) {
+            if (!apiKey) {
+              throw error;
+            }
+            products = await vinmonopolet.searchProducts(trimmedQuery, MAX_LIMIT);
+            source = "official_api";
+          }
+        }
+
         const filtered = params.beerOnly ? products.filter(vinmonopolet.isBeer) : products;
         const limited = filtered.slice(0, params.limit);
         const results = limited.map(toProductSummary);
@@ -956,6 +1034,7 @@ Returns: Matching products with producer, style, ABV, volume, price, and country
           {
             query: params.query,
             beerOnly: params.beerOnly,
+            source,
             totalResults: filtered.length,
             results,
           },
@@ -1028,6 +1107,8 @@ Returns: Name, producer, style, country, ABV, volume, price, availability, and t
           productPageUrl:
             product.availability?.productPageUrl ??
             `https://www.vinmonopolet.no/p/${product.basic.productId}`,
+          imageUrl: buildProductImageUrl(product.basic.productId),
+          imageUrlLarge: buildProductImageUrl(product.basic.productId, 515),
           lastChangedAt: vinmonopolet.getProductLastChangedAt(product),
         };
 
@@ -1059,6 +1140,7 @@ Returns: Name, producer, style, country, ABV, volume, price, availability, and t
           lines.push(tasting.join("\n"));
         }
         lines.push(productDetail.productPageUrl ?? "");
+        lines.push(productDetail.imageUrl ?? "");
 
         return createToolResult(
           GetProductOutputSchema,
@@ -1076,21 +1158,324 @@ Returns: Name, producer, style, country, ABV, volume, price, availability, and t
   );
 }
 
+function registerFindStoresWithStock(server: McpServer): void {
+  server.registerTool(
+    "polvenn_find_stores_with_stock",
+    {
+      title: "Find stores with a product in stock",
+      description: `Find Vinmonopolet stores that currently have a product in stock, ordered by distance.
+
+Uses vinmonopolet.no's store stock locator, so no Vinmonopolet API key is required. Results are best-effort store-level counts.
+
+Args:
+  - articleNumber (string): Vinmonopolet article number
+  - latitude / longitude (number, optional): Search origin. Defaults to your configured home location.
+  - maxResults (number): How many stores to return (default: 5)
+
+Returns: Stores with the product in stock, with stock levels.`,
+      inputSchema: FindStoresWithStockSchema,
+      outputSchema: FindStoresWithStockOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const lat =
+          params.latitude ??
+          (await getConfigValue("home_latitude").then((value) => (value ? Number(value) : null)));
+        const lon =
+          params.longitude ??
+          (await getConfigValue("home_longitude").then((value) => (value ? Number(value) : null)));
+
+        if (lat == null || lon == null) {
+          return createToolError(
+            "No location provided and no home location configured. Use polvenn_configure to set homeLatitude/homeLongitude, or pass latitude/longitude.",
+          );
+        }
+
+        const maxResults = params.maxResults ?? 5;
+        const [stores, product] = await Promise.all([
+          vinmonopolet.findStoresWithProductStock(params.articleNumber, lat, lon, maxResults),
+          vinmonopolet.getProductById(params.articleNumber).catch(() => null),
+        ]);
+        const productName = product ? vinmonopolet.getProductName(product) : null;
+
+        const text =
+          stores.length === 0
+            ? `No stores with **${productName ?? `article ${params.articleNumber}`}** in stock were found near ${lat.toFixed(2)}, ${lon.toFixed(2)}. The product may be sold out everywhere nearby, or stock data may be unavailable.`
+            : [
+                `Stores with **${productName ?? `article ${params.articleNumber}`}** in stock (nearest first):`,
+                ...stores.map(
+                  (store, index) =>
+                    `${index + 1}. **${store.storeName}** — ${store.stockLevel} units (ID: ${store.storeId})`,
+                ),
+              ].join("\n");
+
+        return createToolResult(
+          FindStoresWithStockOutputSchema,
+          {
+            articleNumber: params.articleNumber,
+            productName,
+            latitude: lat,
+            longitude: lon,
+            maxResults,
+            stores,
+          },
+          text,
+        );
+      } catch (error: unknown) {
+        return createToolError(`Error finding stores with stock: ${(error as Error).message}`);
+      }
+    },
+  );
+}
+
+function registerGetChangedProducts(server: McpServer): void {
+  server.registerTool(
+    "polvenn_get_changed_products",
+    {
+      title: "Get recently changed products",
+      description: `List products changed on Vinmonopolet since a date, using the official API's changedSince filter.
+
+Requires a configured Vinmonopolet API key. The cutoff defaults to your last sync (or 7 days ago on first run) and the sync marker is updated on success.
+
+Args:
+  - since (string, optional): yyyy-MM-dd cutoff. Defaults to your last sync, or 7 days ago.
+  - beerOnly (boolean): Only return beers (default: true)
+  - limit (number): Max results (default: 25)
+
+Returns: Products changed since the cutoff, with their lastChanged timestamps.`,
+      inputSchema: GetChangedProductsSchema,
+      outputSchema: GetChangedProductsOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (params) => {
+      try {
+        const fallbackSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+          .toISOString()
+          .split("T")[0];
+        const since = params.since ?? (await getConfigValue("last_product_sync")) ?? fallbackSince;
+
+        const products = await vinmonopolet.getProducts({
+          changedSince: since,
+          maxResults: MAX_LIMIT,
+        });
+        // Official API responses are slim (basic + lastChanged only); fill in
+        // classification/producer from cached or scraped product pages so
+        // beer filtering and result details actually have data to work with.
+        const enriched = await vinmonopolet.enrichSlimProducts(products);
+        const filtered = params.beerOnly ? enriched.filter(vinmonopolet.isBeer) : enriched;
+        const limited = filtered.slice(0, params.limit);
+        const results = limited.map((product) => ({
+          articleNumber: product.basic.productId,
+          name: vinmonopolet.getProductName(product),
+          producer: vinmonopolet.getProductProducer(product),
+          style: vinmonopolet.getProductStyle(product),
+          category: product.classification?.mainProductTypeName ?? null,
+          lastChangedAt: vinmonopolet.getProductLastChangedAt(product),
+        }));
+
+        await setConfig("last_product_sync", new Date().toISOString().split("T")[0]);
+
+        const text =
+          results.length === 0
+            ? `No ${params.beerOnly ? "beers " : "products "}changed on Vinmonopolet since ${since}.`
+            : [
+                `${filtered.length} product(s) changed since ${since}${params.beerOnly ? " (beers shown)" : ""}:`,
+                ...results.map(
+                  (product, index) =>
+                    `${index + 1}. **${product.name}**${product.producer ? ` (${product.producer})` : ""}\n   ${[product.style, product.category].filter(Boolean).join(" | ")} | Art.nr: ${product.articleNumber}${product.lastChangedAt ? ` | Changed: ${product.lastChangedAt}` : ""}`,
+                ),
+              ].join("\n");
+
+        return createToolResult(
+          GetChangedProductsOutputSchema,
+          {
+            since,
+            beerOnly: params.beerOnly,
+            totalResults: filtered.length,
+            results,
+          },
+          text,
+        );
+      } catch (error: unknown) {
+        return createToolError(`Error fetching changed products: ${(error as Error).message}`);
+      }
+    },
+  );
+}
+
+function registerGetFacets(server: McpServer): void {
+  server.registerTool(
+    "polvenn_get_facets",
+    {
+      title: "List search facets",
+      description: `List the available search filters (facets) from vinmonopolet.no: categories, styles, countries, price ranges, and more, with result counts.
+
+Useful for discovering valid filter values before searching. No API key required.`,
+      inputSchema: GetFacetsSchema,
+      outputSchema: GetFacetsOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async () => {
+      try {
+        const facets = await vinmonopolet.getSearchFacets();
+        const text =
+          facets.length === 0
+            ? "No facets were returned by vinmonopolet.no."
+            : facets
+                .map((facet) => {
+                  const title = facet.displayName ?? facet.name;
+                  const values = facet.values
+                    .map(
+                      (value) => `${value.name}${value.count != null ? ` (${value.count})` : ""}`,
+                    )
+                    .join(", ");
+                  return `**${title}**: ${values || "(no values)"}`;
+                })
+                .join("\n");
+
+        return createToolResult(GetFacetsOutputSchema, { facets }, text);
+      } catch (error: unknown) {
+        return createToolError(`Error fetching facets: ${(error as Error).message}`);
+      }
+    },
+  );
+}
+
+const STOCK_WATCH_CHECKPOINT_KEY = "stock-watch";
+
+interface StockWatchResult {
+  articleNumber: string;
+  productName: string | null;
+  storeId: string | null;
+  storeName: string | null;
+  inStock: boolean | null;
+  stockLevel: number | null;
+  newInStock: boolean;
+  stockSource: string | null;
+  message: string | null;
+}
+
+/**
+ * Evaluates 'stock' rules against live store stock at the resolved store.
+ * Checkpoint keys only track currently-in-stock articles, so a beer that
+ * sells out and returns is reported as new again.
+ */
+async function evaluateStockRules(articleNumbers: string[]): Promise<StockWatchResult[]> {
+  const seenKeys = new Set(await getSeenWatchlistMatchKeys(STOCK_WATCH_CHECKPOINT_KEY));
+
+  let store: ResolvedStoreContext | null = null;
+  try {
+    store = await resolveStoreContext();
+  } catch {
+    store = null;
+  }
+
+  const results: StockWatchResult[] = [];
+  for (const articleNumber of articleNumbers) {
+    if (!store) {
+      results.push({
+        articleNumber,
+        productName: null,
+        storeId: null,
+        storeName: null,
+        inStock: null,
+        stockLevel: null,
+        newInStock: false,
+        stockSource: null,
+        message:
+          "No store could be resolved. Set a home store or home location with polvenn_configure.",
+      });
+      continue;
+    }
+
+    let check: Awaited<ReturnType<typeof vinmonopolet.checkStoreStock>> | null = null;
+    let errorMessage: string | null = null;
+    try {
+      check = await vinmonopolet.checkStoreStock(articleNumber, store.storeId);
+    } catch (error: unknown) {
+      errorMessage = (error as Error).message;
+    }
+
+    const product = await vinmonopolet.getProductById(articleNumber).catch(() => null);
+    const inStock =
+      check?.storeStockConclusion === "in_stock"
+        ? true
+        : check?.storeStockConclusion === "out_of_stock"
+          ? false
+          : null;
+    const stockKey = `stock:${articleNumber}:${store.storeId}:in_stock`;
+
+    results.push({
+      articleNumber,
+      productName: product ? vinmonopolet.getProductName(product) : null,
+      storeId: store.storeId,
+      storeName: store.storeName,
+      inStock,
+      stockLevel: check?.stockLevel ?? null,
+      newInStock: inStock === true && !seenKeys.has(stockKey),
+      stockSource: check?.stockSource ?? null,
+      message: errorMessage ?? check?.message ?? null,
+    });
+  }
+
+  if (store) {
+    const currentInStockKeys = results
+      .filter((result) => result.inStock === true && result.storeId != null)
+      .map((result) => `stock:${result.articleNumber}:${result.storeId}:in_stock`);
+    await setSeenWatchlistMatchKeys(STOCK_WATCH_CHECKPOINT_KEY, currentInStockKeys);
+  }
+
+  return results;
+}
+
+function formatStockResults(results: StockWatchResult[]): string {
+  const lines = results.map((result) => {
+    const label = result.productName ?? `Article ${result.articleNumber}`;
+    const suffix =
+      result.inStock === true
+        ? `in stock${result.stockLevel != null ? ` (${result.stockLevel} units)` : ""}${result.newInStock ? " — NEW" : ""}`
+        : result.inStock === false
+          ? "out of stock"
+          : `stock unknown${result.message ? `: ${result.message}` : ""}`;
+    const icon = result.inStock === true ? "✅" : result.inStock === false ? "❌" : "❔";
+    return `- ${icon} ${label} (${result.articleNumber}) — ${suffix}`;
+  });
+
+  const storeName = results.find((result) => result.storeName != null)?.storeName ?? "your store";
+  return `**Stock watch** (at ${storeName}):\n${lines.join("\n")}`;
+}
+
 function registerWatchlist(server: McpServer): void {
   server.registerTool(
     "polvenn_watchlist",
     {
       title: "Beer watchlist",
-      description: `Manage your beer watchlist. Track breweries, styles, series, keywords, countries, or ABV/price ranges to get notified about matching releases.
+      description: `Manage your beer watchlist. Track breweries, styles, series, keywords, countries, ABV/price ranges, or watch a single article's stock at your home store.
 
 Args:
   - action ('add' | 'remove' | 'list' | 'check'): What to do
-  - type ('brewery' | 'style' | 'series' | 'keyword' | 'country' | 'abv' | 'price'): Rule type (required for 'add')
-  - value (string): What to watch for (required for text rules; derived for abv/price)
+  - type ('brewery' | 'style' | 'series' | 'keyword' | 'country' | 'abv' | 'price' | 'stock'): Rule type (required for 'add')
+  - value (string): What to watch for (required for text rules; article number for 'stock'; derived for abv/price)
   - minValue / maxValue (number): Bounds for 'abv'/'price' rules (at least one required)
   - id (number): Entry ID to remove (required for 'remove')
 
-Note: price rules are best-effort — prices are looked up via Vinmonopolet and reported as not evaluated when unavailable.`,
+Note: price rules are best-effort — prices are looked up via Vinmonopolet and reported as not evaluated when unavailable. Stock rules check live store stock at your home store during 'check' and report new arrivals.`,
       inputSchema: WatchlistSchema,
       outputSchema: WatchlistOutputSchema,
       annotations: {
@@ -1121,6 +1506,13 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
               minValue = params.minValue;
               maxValue = params.maxValue;
               value = formatNumericRuleValue(params.type, minValue, maxValue);
+            } else if (params.type === "stock") {
+              if (!params.value || !/^\d+$/.test(params.value.trim())) {
+                return createToolError(
+                  "Stock rules need 'value' set to a numeric Vinmonopolet article number.",
+                );
+              }
+              value = params.value.trim();
             } else {
               if (!params.value) {
                 return createToolError("'value' is required for 'add' action with text rules.");
@@ -1194,6 +1586,21 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
               );
             }
 
+            // Stock rules are independent of the release feed, so evaluate
+            // them first — a stock check works even when the feed is down.
+            const stockArticleNumbers = Array.from(
+              new Set(
+                entries
+                  .filter((entry) => entry.type === "stock")
+                  .map((entry) => entry.value.trim()),
+              ),
+            );
+            const stockResults =
+              stockArticleNumbers.length > 0
+                ? await evaluateStockRules(stockArticleNumbers)
+                : undefined;
+            const stockText = stockResults ? `\n\n${formatStockResults(stockResults)}` : "";
+
             const latestRelease = await releaseFeed.getLatestRelease();
 
             if (!latestRelease) {
@@ -1206,8 +1613,9 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
                   release: null,
                   newMatches: [],
                   repeatedMatches: [],
+                  stockResults,
                 },
-                "No releases were found in the external release feed to check against.",
+                `No releases were found in the external release feed to check against.${stockText}`,
               );
             }
 
@@ -1258,10 +1666,11 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
                   unevaluatedPriceBeers,
                   newMatches: [],
                   repeatedMatches: [],
+                  stockResults,
                 },
                 unevaluatedPriceBeers > 0
-                  ? `${noMatchText}\n\nNote: price rules could not be evaluated for ${unevaluatedPriceBeers} beer(s) with unknown prices.`
-                  : noMatchText,
+                  ? `${noMatchText}\n\nNote: price rules could not be evaluated for ${unevaluatedPriceBeers} beer(s) with unknown prices.${stockText}`
+                  : `${noMatchText}${stockText}`,
               );
             }
 
@@ -1288,6 +1697,8 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
               text += `\n\nNote: price rules could not be evaluated for ${unevaluatedPriceBeers} beer(s) with unknown prices.`;
             }
 
+            text += stockText;
+
             return createToolResult(
               WatchlistOutputSchema,
               {
@@ -1299,6 +1710,7 @@ Note: price rules are best-effort — prices are looked up via Vinmonopolet and 
                 unevaluatedPriceBeers,
                 newMatches,
                 repeatedMatches,
+                stockResults,
               },
               text,
             );

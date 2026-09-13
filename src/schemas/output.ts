@@ -71,6 +71,13 @@ export const CheckStoreStockOutputSchema = z.object({
   availability: ProductAvailabilitySchema.nullable(),
 });
 
+const OpeningHoursEntrySchema = z.object({
+  dayOfTheWeek: z.string(),
+  openingTime: z.string(),
+  closingTime: z.string(),
+  closed: z.boolean(),
+});
+
 const NearbyStoreSchema = z.object({
   storeId: z.string(),
   storeName: z.string(),
@@ -90,18 +97,10 @@ const NearbyStoreSchema = z.object({
   category: z.string().optional(),
   openingHours: z
     .object({
-      regularHours: z
-        .array(
-          z.object({
-            dayOfTheWeek: z.string(),
-            openingTime: z.string(),
-            closingTime: z.string(),
-            closed: z.boolean(),
-          }),
-        )
-        .optional(),
+      regularHours: z.array(OpeningHoursEntrySchema).optional(),
     })
     .optional(),
+  todayOpeningHours: OpeningHoursEntrySchema.nullable().optional(),
   distanceKm: z.number(),
 });
 
@@ -120,6 +119,7 @@ const WatchlistRuleTypeSchema = z.enum([
   "country",
   "abv",
   "price",
+  "stock",
 ]);
 
 const WatchlistEntrySchema = z.object({
@@ -172,6 +172,22 @@ export const WatchlistOutputSchema = z.object({
   unevaluatedPriceBeers: z.number().int().optional(),
   newMatches: z.array(WatchlistMatchSchema).optional(),
   repeatedMatches: z.array(WatchlistMatchSchema).optional(),
+  // Live results for 'stock' rules (one article watched at the home store).
+  stockResults: z
+    .array(
+      z.object({
+        articleNumber: z.string(),
+        productName: z.string().nullable(),
+        storeId: z.string().nullable(),
+        storeName: z.string().nullable(),
+        inStock: z.boolean().nullable(),
+        stockLevel: z.number().nullable(),
+        newInStock: z.boolean(),
+        stockSource: z.string().nullable(),
+        message: z.string().nullable(),
+      }),
+    )
+    .optional(),
 });
 
 const ProductSummarySchema = z.object({
@@ -186,11 +202,13 @@ const ProductSummarySchema = z.object({
   country: z.string().nullable(),
   status: z.string().nullable(),
   productPageUrl: z.string().nullable(),
+  imageUrl: z.string().nullable(),
 });
 
 export const SearchProductsOutputSchema = z.object({
   query: z.string(),
   beerOnly: z.boolean(),
+  source: z.enum(["official_api", "website", "product_lookup"]),
   totalResults: z.number().int(),
   results: z.array(ProductSummarySchema),
 });
@@ -220,9 +238,57 @@ export const GetProductOutputSchema = z.object({
       odour: z.string().nullable().optional(),
       taste: z.string().nullable().optional(),
       productPageUrl: z.string().nullable().optional(),
+      imageUrl: z.string().nullable().optional(),
+      imageUrlLarge: z.string().nullable().optional(),
       lastChangedAt: z.string().nullable().optional(),
     })
     .nullable(),
+});
+
+export const FindStoresWithStockOutputSchema = z.object({
+  articleNumber: z.string(),
+  productName: z.string().nullable(),
+  latitude: z.number(),
+  longitude: z.number(),
+  maxResults: z.number().int(),
+  stores: z.array(
+    z.object({
+      storeId: z.string(),
+      storeName: z.string(),
+      stockLevel: z.number(),
+    }),
+  ),
+});
+
+export const GetChangedProductsOutputSchema = z.object({
+  since: z.string(),
+  beerOnly: z.boolean(),
+  totalResults: z.number().int(),
+  results: z.array(
+    z.object({
+      articleNumber: z.string(),
+      name: z.string(),
+      producer: z.string().nullable(),
+      style: z.string().nullable(),
+      category: z.string().nullable(),
+      lastChangedAt: z.string().nullable(),
+    }),
+  ),
+});
+
+export const GetFacetsOutputSchema = z.object({
+  facets: z.array(
+    z.object({
+      name: z.string(),
+      displayName: z.string().nullable(),
+      values: z.array(
+        z.object({
+          name: z.string(),
+          count: z.number().nullable(),
+        }),
+      ),
+    }),
+  ),
 });
 
 const ConfigSummarySchema = z.object({

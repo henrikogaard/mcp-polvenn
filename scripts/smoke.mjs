@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
-const EXPECTED_MIN_TOOLS = 10;
+const EXPECTED_MIN_TOOLS = 13;
 const EXPECTED_MIN_RESOURCES = 2;
 const EXPECTED_MIN_PROMPTS = 3;
 const TIMEOUT_MS = 15_000;

@@ -7,10 +7,18 @@ import { closeDb, persistDb } from "./db/database.js";
 import { registerPrompts } from "./prompts/index.js";
 import { registerResources } from "./resources/index.js";
 import { registerAllTools } from "./tools/index.js";
+import { setDiagnosticsListener } from "./utils/diagnostics.js";
 
 const server = new McpServer({
   name: SERVER_NAME,
   version: SERVER_VERSION,
+});
+
+// Surface runtime degradation (e.g. dropped malformed upstream entries) as MCP
+// logging notifications in addition to stderr. Notification failures (e.g. no
+// client connected yet) must never affect behavior.
+setDiagnosticsListener((message) => {
+  server.sendLoggingMessage({ level: "warning", data: `polvenn: ${message}` }).catch(() => {});
 });
 
 registerAllTools(server);

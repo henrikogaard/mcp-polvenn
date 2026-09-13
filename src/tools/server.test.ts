@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetStateForTests, setConfig } from "../db/database.js";
 import { registerPrompts } from "../prompts/index.js";
 import { registerResources } from "../resources/index.js";
+import { resetStoreListCacheForTests } from "../services/vinmonopolet.js";
 import { registerAllTools } from "./index.js";
 
 interface FetchRoute {
@@ -134,8 +135,10 @@ describe("MCP server (end-to-end over in-memory transport)", () => {
   let server: McpServer;
 
   beforeEach(async () => {
-    // All tests in this file share one per-file db; start each test clean.
+    // All tests in this file share one per-file db and module registry;
+    // start each test clean (db state + in-memory store-list cache).
     await resetStateForTests();
+    resetStoreListCacheForTests();
 
     server = new McpServer({ name: "polvenn-test", version: "0.0.0" });
     registerAllTools(server);
@@ -170,6 +173,9 @@ describe("MCP server (end-to-end over in-memory transport)", () => {
       "polvenn_check_store_stock",
       "polvenn_configure",
       "polvenn_find_nearby_stores",
+      "polvenn_find_stores_with_stock",
+      "polvenn_get_changed_products",
+      "polvenn_get_facets",
       "polvenn_get_product",
       "polvenn_search_new_beers",
       "polvenn_search_new_beers_near_store",
@@ -351,25 +357,36 @@ describe("MCP server (end-to-end over in-memory transport)", () => {
     expect(summary.ok).toBeGreaterThan(0);
   });
 
-  it("searches the product catalogue with an optional beer filter", async () => {
+  it("searches the product catalogue website-first with an optional beer filter", async () => {
     await setConfig("vinmonopolet_api_key", "dummy-key");
     stubFetchRoutes([
       {
-        match: (url) =>
-          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
-          url.includes("productShortNameContains="),
-        body: [
-          detailedProduct,
-          {
-            basic: { productId: "407", productShortName: "Gilmour Vin Norrøn Cider" },
-            classification: { mainProductTypeId: "9", mainProductTypeName: "Cider" },
-          },
-        ],
+        match: (url) => url.startsWith("https://www.vinmonopolet.no/vmpws/v2/vmp/products/search"),
+        body: {
+          products: [
+            {
+              code: "20162402",
+              name: "Norrøn Øl",
+              main_category: { name: "Øl" },
+              main_producer: { name: "Bryggeriet" },
+            },
+            {
+              code: "407",
+              name: "Gilmour Vin Norrøn Cider",
+              main_category: { name: "Cider" },
+            },
+          ],
+          pagination: { totalPages: 1 },
+        },
       },
     ]);
 
     const all = await callTool("polvenn_search_products", { query: "norrøn" });
-    expect(all.structuredContent).toMatchObject({ query: "norrøn", totalResults: 2 });
+    expect(all.structuredContent).toMatchObject({
+      query: "norrøn",
+      source: "website",
+      totalResults: 2,
+    });
     expect((all.structuredContent as { results: unknown[] }).results).toHaveLength(2);
 
     const beersOnly = await callTool("polvenn_search_products", {
@@ -377,6 +394,25 @@ describe("MCP server (end-to-end over in-memory transport)", () => {
       beerOnly: true,
     });
     expect(beersOnly.structuredContent).toMatchObject({ beerOnly: true, totalResults: 1 });
+  });
+
+  it("falls back to the official API when the website search fails and a key exists", async () => {
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    stubFetchRoutes([
+      {
+        match: (url) => url.startsWith("https://www.vinmonopolet.no/vmpws/v2/vmp/products/search"),
+        body: { errors: [{ message: " Exploded" }] },
+      },
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("productShortNameContains="),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const result = await callTool("polvenn_search_products", { query: "norrøn" });
+    expect(result.structuredContent).toMatchObject({ source: "official_api", totalResults: 1 });
   });
 
   it("resolves a numeric article query via get_product", async () => {
@@ -481,5 +517,305 @@ describe("MCP server (end-to-end over in-memory transport)", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("minValue");
+  });
+
+  it("reports stock rules with new arrivals during check", async () => {
+    await setConfig("release_feed_url", "https://feed.test");
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    await setConfig("home_store_id", "170");
+    stubFetchRoutes([
+      releaseFeedRoute,
+      storesRoute,
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/accumulated-stock"),
+        body: [{ productId: "20162402", storeId: "170", stock: 6 }],
+      },
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("productId="),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const add = await callTool("polvenn_watchlist", {
+      action: "add",
+      type: "stock",
+      value: "20162402",
+    });
+    expect(add.structuredContent).toMatchObject({
+      action: "add",
+      entry: { type: "stock", value: "20162402" },
+    });
+
+    const firstCheck = await callTool("polvenn_watchlist", { action: "check" });
+    const stockResults = (
+      firstCheck.structuredContent as {
+        stockResults: Array<{
+          articleNumber: string;
+          inStock: boolean | null;
+          newInStock: boolean;
+        }>;
+      }
+    ).stockResults;
+    expect(stockResults).toHaveLength(1);
+    expect(stockResults[0]).toMatchObject({
+      articleNumber: "20162402",
+      inStock: true,
+      newInStock: true,
+    });
+    expect(firstCheck.content[0].text).toContain("Stock watch");
+
+    // Second check sees the same in-stock state as not new.
+    const secondCheck = await callTool("polvenn_watchlist", { action: "check" });
+    const secondResults = (
+      secondCheck.structuredContent as { stockResults: Array<{ newInStock: boolean }> }
+    ).stockResults;
+    expect(secondResults[0].newInStock).toBe(false);
+  });
+
+  it("rejects stock rules without a numeric article number", async () => {
+    const result = await callTool("polvenn_watchlist", {
+      action: "add",
+      type: "stock",
+      value: "not-a-number",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("article number");
+  });
+
+  it("finds stores with a product in stock via the website locator", async () => {
+    stubFetchRoutes([
+      {
+        match: (url) => url === "https://www.vinmonopolet.no/vmpws/v2/vmp/stores/170?fields=FULL",
+        body: { id: "170", name: "170", geoPoint: { latitude: 58.97, longitude: 5.73 } },
+      },
+      {
+        match: (url) => url.includes("/vmpws/v2/vmp/products/20162402/stock"),
+        body: {
+          stores: [
+            {
+              pointOfService: { id: "170", displayName: "Stavanger, Klubbgata" },
+              stockInfo: { stockLevel: 4 },
+            },
+            {
+              pointOfService: { id: "116", displayName: "Sandnes, Kvadrat" },
+              stockInfo: { stockLevel: 2 },
+            },
+          ],
+          pagination: { totalPages: 1 },
+        },
+      },
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("productId=20162402"),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const result = await callTool("polvenn_find_stores_with_stock", {
+      articleNumber: "20162402",
+      latitude: 58.97,
+      longitude: 5.73,
+      maxResults: 5,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      articleNumber: "20162402",
+      productName: "Amundsen The Darkening Imp",
+      stores: [
+        { storeId: "170", storeName: "Stavanger, Klubbgata", stockLevel: 4 },
+        { storeId: "116", storeName: "Sandnes, Kvadrat", stockLevel: 2 },
+      ],
+    });
+  });
+
+  it("lists products changed since a date via the official API", async () => {
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    stubFetchRoutes([
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("changedSince=2026-09-01"),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const result = await callTool("polvenn_get_changed_products", {
+      since: "2026-09-01",
+      beerOnly: true,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      since: "2026-09-01",
+      beerOnly: true,
+      totalResults: 1,
+    });
+    expect(
+      (result.structuredContent as { results: Array<{ articleNumber: string }> }).results,
+    ).toEqual([expect.objectContaining({ articleNumber: "20162402" })]);
+  });
+
+  it("lists search facets from the website", async () => {
+    stubFetchRoutes([
+      {
+        match: (url) => url.startsWith("https://www.vinmonopolet.no/vmpws/v2/vmp/products/search"),
+        body: {
+          products: [],
+          facets: [
+            {
+              code: "mainCategory",
+              name: "Varegruppe",
+              values: [{ code: "øl", name: "Øl", count: 1000 }],
+            },
+          ],
+          pagination: { totalPages: 1 },
+        },
+      },
+    ]);
+
+    const result = await callTool("polvenn_get_facets", {});
+    expect(result.structuredContent).toMatchObject({
+      facets: [
+        { name: "mainCategory", displayName: "Varegruppe", values: [{ name: "Øl", count: 1000 }] },
+      ],
+    });
+  });
+
+  it("falls back to keyless website search when no API key is configured", async () => {
+    await setConfig("vinmonopolet_api_key", "");
+    stubFetchRoutes([
+      {
+        match: (url) => url.startsWith("https://www.vinmonopolet.no/vmpws/v2/vmp/products/search"),
+        body: {
+          products: [
+            {
+              code: "20162402",
+              name: "Website Beer",
+              price: { value: 99 },
+              main_category: { name: "Øl" },
+            },
+          ],
+          pagination: { totalPages: 1 },
+        },
+      },
+    ]);
+
+    const result = await callTool("polvenn_search_products", { query: "website beer" });
+
+    expect(result.structuredContent).toMatchObject({
+      source: "website",
+      totalResults: 1,
+    });
+    expect(
+      (result.structuredContent as { results: Array<{ imageUrl: string }> }).results[0].imageUrl,
+    ).toContain("bilder.vinmonopolet.no");
+  });
+
+  it("resolves products by EAN-13 barcode", async () => {
+    stubFetchRoutes([
+      {
+        match: (url) => url.includes("/vmpws/v2/vmp/products/barCodeSearch/7040514300215"),
+        body: { code: "1234501", name: "Barcode Beer", main_category: { name: "Øl" } },
+      },
+    ]);
+
+    const result = await callTool("polvenn_search_products", { query: "7040514300215" });
+
+    expect(result.structuredContent).toMatchObject({
+      source: "product_lookup",
+      totalResults: 1,
+    });
+    expect(
+      (result.structuredContent as { results: Array<{ articleNumber: string }> }).results[0]
+        .articleNumber,
+    ).toBe("1234501");
+  });
+
+  it("includes product image URLs in get_product", async () => {
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    stubFetchRoutes([
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("productId=20162402"),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const details = await callTool("polvenn_get_product", { articleNumber: "20162402" });
+    const product = (details.structuredContent as { product: Record<string, unknown> }).product;
+    expect(product.imageUrl).toBe("https://bilder.vinmonopolet.no/cache/300x300-0/20162402-1.jpg");
+    expect(product.imageUrlLarge).toContain("515x515-0");
+  });
+
+  it("exposes product and store resource templates", async () => {
+    const { resourceTemplates } = await client.listResourceTemplates();
+    expect(resourceTemplates.map((template) => template.uriTemplate).sort()).toEqual([
+      "polvenn://product/{articleNumber}",
+      "polvenn://store/{storeId}",
+    ]);
+
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    stubFetchRoutes([
+      {
+        match: (url) =>
+          url.startsWith("https://apis.vinmonopolet.no/products/v0/details-normal") &&
+          url.includes("productId=20162402"),
+        body: [detailedProduct],
+      },
+    ]);
+
+    const read = await client.readResource({ uri: "polvenn://product/20162402" });
+    const payload = JSON.parse((read.contents[0] as { text: string }).text);
+    expect(payload.basic.productId).toBe("20162402");
+    expect(payload.imageUrl).toContain("bilder.vinmonopolet.no");
+  });
+
+  it("includes today's opening hours for nearby stores", async () => {
+    await setConfig("vinmonopolet_api_key", "dummy-key");
+    const today = new Date().toLocaleDateString("en-US", { weekday: "long" });
+    stubFetchRoutes([
+      {
+        match: (url) => url.startsWith("https://apis.vinmonopolet.no/stores/v0/details"),
+        body: [
+          {
+            storeId: "170",
+            storeName: "Stavanger, Klubbgata",
+            status: "open",
+            address: {
+              street: "Klubbgata 1",
+              postalCode: "4006",
+              city: "Stavanger",
+              gpsCoord: "58.970389;5.733810",
+            },
+            category: "Klasse D",
+            openingHours: {
+              regularHours: [
+                { dayOfTheWeek: today, openingTime: "10:00", closingTime: "17:00", closed: false },
+              ],
+            },
+          },
+        ],
+      },
+    ]);
+
+    const result = await callTool("polvenn_find_nearby_stores", {
+      latitude: 58.97,
+      longitude: 5.73,
+      maxResults: 1,
+    });
+
+    const stores = (
+      result.structuredContent as {
+        stores: Array<{ todayOpeningHours: { closed: boolean } | null }>;
+      }
+    ).stores;
+    expect(stores[0].todayOpeningHours).toMatchObject({ closed: false });
+    expect(result.content[0].text).toContain("Open today 10:00–17:00");
   });
 });

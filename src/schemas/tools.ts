@@ -84,16 +84,16 @@ export const WatchlistSchema = z.strictObject({
     .enum(["add", "remove", "list", "check"])
     .describe("Watchlist action: add a rule, remove by ID, list all rules, or check for matches"),
   type: z
-    .enum(["brewery", "style", "series", "keyword", "country", "abv", "price"])
+    .enum(["brewery", "style", "series", "keyword", "country", "abv", "price", "stock"])
     .optional()
     .describe(
-      "Type of watch rule (required for 'add'). brewery/style/series/keyword/country match text; abv and price match numeric bounds.",
+      "Type of watch rule (required for 'add'). brewery/style/series/keyword/country match text; abv and price match numeric bounds; stock watches one article number at your home store.",
     ),
   value: z
     .string()
     .optional()
     .describe(
-      "Value to watch for (required for 'add' with text rules). Derived automatically for abv/price rules.",
+      "Value to watch for (required for 'add' with text rules and stock article numbers). Derived automatically for abv/price rules.",
     ),
   minValue: z
     .number()
@@ -110,14 +110,50 @@ export const SearchProductsSchema = z.strictObject({
   query: z
     .string()
     .min(1)
-    .describe("Product name, partial name, or exact Vinmonopolet article number"),
+    .describe("Product name, partial name, exact Vinmonopolet article number, or EAN-13 barcode"),
   beerOnly: z.boolean().default(false).describe("Only return beer products (default: false)"),
+  sort: z
+    .enum(["relevance", "name_asc", "name_desc", "price_asc", "price_desc"])
+    .optional()
+    .describe(
+      "Result ordering (used for website search; the official API always returns relevance order)",
+    ),
   limit: z.number().int().min(1).max(100).default(25).describe("Maximum results to return"),
 });
 
 export const GetProductSchema = z.strictObject({
   articleNumber: z.string().min(1).describe("Vinmonopolet article number (e.g. '20537202')"),
 });
+
+export const FindStoresWithStockSchema = z.strictObject({
+  articleNumber: z.string().min(1).describe("Vinmonopolet article number to find in stock"),
+  latitude: z
+    .number()
+    .min(-90)
+    .max(90)
+    .optional()
+    .describe("Latitude. Defaults to your home location."),
+  longitude: z
+    .number()
+    .min(-180)
+    .max(180)
+    .optional()
+    .describe("Longitude. Defaults to your home location."),
+  maxResults: z.number().int().min(1).max(20).default(5).describe("Number of stores to return"),
+});
+
+export const GetChangedProductsSchema = z.strictObject({
+  since: z
+    .string()
+    .optional()
+    .describe(
+      "yyyy-MM-dd cutoff for changes. Defaults to your last sync, or 7 days ago on first run.",
+    ),
+  beerOnly: z.boolean().default(true).describe("Only return beer products (default: true)"),
+  limit: z.number().int().min(1).max(100).default(25).describe("Maximum results to return"),
+});
+
+export const GetFacetsSchema = z.strictObject({});
 
 export const ConfigureSchema = z.strictObject({
   releaseFeedUrl: z.url().optional().describe("Base URL for your external release feed API"),
