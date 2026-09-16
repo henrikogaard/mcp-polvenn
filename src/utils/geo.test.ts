@@ -1,12 +1,14 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it } from "vitest";
 import { haversineDistanceKm } from "./geo.js";
 
-test("haversineDistanceKm returns zero for identical coordinates", () => {
-  assert.equal(haversineDistanceKm(58.97, 5.73, 58.97, 5.73), 0);
-});
+describe("haversineDistanceKm", () => {
+  it("returns zero for identical coordinates", () => {
+    expect(haversineDistanceKm(58.97, 5.73, 58.97, 5.73)).toBe(0);
+  });
 
-test("haversineDistanceKm returns a realistic distance", () => {
-  const distance = haversineDistanceKm(59.91, 10.75, 60.39, 5.32);
-  assert.ok(distance > 290 && distance < 320);
+  it("returns a realistic distance", () => {
+    const distance = haversineDistanceKm(59.91, 10.75, 60.39, 5.32);
+    expect(distance).toBeGreaterThan(290);
+    expect(distance).toBeLessThan(320);
+  });
 });

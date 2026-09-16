@@ -31,3 +31,9 @@ Thumbs.db
 # Test/coverage artifacts
 coverage/
 .nyc_output/
+
+# Local agent session artifacts
+.zcode/
+
+# Live probe fixtures (local reference data)
+fixtures/
