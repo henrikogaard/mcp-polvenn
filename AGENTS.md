@@ -147,11 +147,30 @@ The watchlist supports:
 
 ---
 
-## Current status
+## Agent workflow
 
-The project builds and tests cleanly.
+- Before editing, inspect the repository root, branch, worktree, status, remote,
+  and any existing PR for the current outcome. Preserve unrelated changes.
+- Fixes and features use `fix/<short-name>` or `feature/<short-name>` from
+  `main`, followed by focused verification, an explicit commit, push, and a PR
+  to `main`. Never implement directly on `main`.
+- One PR delivers one coherent outcome. Reuse an existing branch and PR for
+  that outcome instead of opening sibling PRs. Independent outcomes target
+  `main`; dependent reviewable slices may form a linear stack where each child
+  targets its immediate parent. If `main` or a parent moves, use a cascading
+  rebase only for the stack owned by this session; never rewrite unrelated or
+  shared work.
+- Ready for review means the branch is pushed, the PR is non-draft, the target
+  is correct, and verification evidence plus skipped checks are recorded.
+  Never merge a PR without Henrik explicitly authorizing that specific merge.
+- Keep Vinmonopolet keys, release-feed credentials, local databases, and raw
+  provider responses out of commits, fixtures, and logs. Tests must not require
+  live credentials unless Henrik explicitly authorizes a live check.
 
-Useful validation commands:
+## Verification
+
+Do not treat a previous status statement as current evidence. Run the checks
+that cover the changed surface and record failures or skips:
 
 ```bash
 npm run typecheck
